@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PAGASA 5-Day Weather Tool</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="hero">
+    <div>
+      <p class="eyebrow">DOST–PAGASA DATA VIEW</p>
+      <h1>5-Day Weather Forecast</h1>
+      <p id="issued">Loading the latest PAGASA forecast…</p>
+    </div>
+    <div class="actions">
+      <button id="refresh">Refresh data</button>
+      <a class="button primary" href="/api/export">Export Excel</a>
+    </div>
+  </header>
+  <main>
+    <section class="statusbar">
+      <span><span id="status">Connecting to PAGASA…</span> · <span id="next-refresh">Auto-refresh every 30 minutes</span></span>
+      <span id="retrieved"></span>
+    </section>
+    <section class="table-shell">
+      <table>
+        <thead><tr id="head"><th>Region</th><th>Site</th></tr></thead>
+        <tbody id="forecast-body"></tbody>
+      </table>
+    </section>
+    <p class="note">Sites not published individually by PAGASA use the nearest available selected-city outlook. The source city is shown below each site.</p>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
