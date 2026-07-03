@@ -4,3 +4,4 @@ __pycache__/
 .vercel/
 test-export.xlsx
 api-export-test.xlsx
+data/overrides.json

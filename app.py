@@ -3,21 +3,32 @@ from __future__ import annotations
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+import hashlib
+import hmac
+import json
+import os
 import re
+import secrets
+import time
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 SNAPSHOT = ROOT / "data" / "pagasa_selected_cities.html"
 PAGASA_URL = "https://www.pagasa.dost.gov.ph/weather/weather-outlook-selected-philippine-cities"
+LOCAL_OVERRIDES = ROOT / "data" / "overrides.json"
+OVERRIDE_PREFIX = "pagasa-weather-overrides/"
+FORECAST_WINDOW = "8:00 AM – 8:00 AM next day"
+_override_cache = {"loaded_at": 0.0, "data": {}}
 
 SITES = [
     ("LUZON", "Alabang", "Metro Manila"),
@@ -36,6 +47,102 @@ SITES = [
 
 app = FastAPI(title="PAGASA 5-Day Weather Tool")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+class LoginPayload(BaseModel):
+    password: str
+
+
+class OverridePayload(BaseModel):
+    site: str
+    date: str
+    red: bool
+
+
+def automatic_severity(condition: str) -> str:
+    text = condition.casefold()
+    if any(word in text for word in ("torrential", "heavy", "intense")):
+        return "orange"
+    if "moderate" in text:
+        return "yellow"
+    if any(word in text for word in ("light rain", "rainfall", "rainshowers", "rain", "thunderstorm")):
+        return "green"
+    return "none"
+
+
+def override_key(site: str, date: str) -> str:
+    return f"{site.strip().casefold()}|{date.strip().casefold()}"
+
+
+def _local_overrides() -> dict:
+    try:
+        return json.loads(LOCAL_OVERRIDES.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def load_overrides(force: bool = False) -> dict:
+    now = time.time()
+    if not force and now - _override_cache["loaded_at"] < 10:
+        return dict(_override_cache["data"])
+    if not os.getenv("BLOB_READ_WRITE_TOKEN"):
+        data = _local_overrides()
+    else:
+        try:
+            from vercel.blob import list_objects
+
+            result = list_objects(prefix=OVERRIDE_PREFIX, limit=100)
+            latest = max(result.blobs, key=lambda item: item.uploaded_at, default=None)
+            data = requests.get(latest.url, params={"v": int(now)}, timeout=10).json() if latest else {}
+        except Exception:
+            data = dict(_override_cache["data"])
+    _override_cache.update({"loaded_at": now, "data": data})
+    return dict(data)
+
+
+def save_overrides(data: dict) -> None:
+    if os.getenv("BLOB_READ_WRITE_TOKEN"):
+        from vercel.blob import BlobClient
+
+        filename = f"{OVERRIDE_PREFIX}{int(time.time() * 1000)}-{secrets.token_hex(4)}.json"
+        BlobClient().put(
+            filename,
+            json.dumps(data, separators=(",", ":")).encode("utf-8"),
+            access="public",
+            content_type="application/json",
+            cache_control_max_age=60,
+        )
+    else:
+        LOCAL_OVERRIDES.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _override_cache.update({"loaded_at": time.time(), "data": dict(data)})
+
+
+def verify_password(password: str) -> bool:
+    encoded = os.getenv("ADMIN_PASSWORD_HASH", "")
+    try:
+        iterations_text, salt_hex, expected_hex = encoded.split("$", 2)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations_text))
+        return hmac.compare_digest(actual.hex(), expected_hex)
+    except (TypeError, ValueError):
+        return False
+
+
+def session_token() -> str:
+    expires = int(time.time()) + 8 * 60 * 60
+    secret = os.getenv("ADMIN_SESSION_SECRET", "")
+    signature = hmac.new(secret.encode(), str(expires).encode(), hashlib.sha256).hexdigest()
+    return f"{expires}.{signature}"
+
+
+def is_admin(request: Request) -> bool:
+    token = request.cookies.get("pagasa_admin", "")
+    secret = os.getenv("ADMIN_SESSION_SECRET", "")
+    try:
+        expires_text, signature = token.split(".", 1)
+        expected = hmac.new(secret.encode(), expires_text.encode(), hashlib.sha256).hexdigest()
+        return bool(secret) and int(expires_text) > int(time.time()) and hmac.compare_digest(signature, expected)
+    except (TypeError, ValueError):
+        return False
 
 
 def fetch_html() -> tuple[str, str]:
@@ -97,13 +204,25 @@ def build_payload() -> dict:
     html, source_mode = fetch_html()
     parsed = parse_pagasa(html)
     rows = []
+    overrides = load_overrides()
     for region, site, source_city in SITES:
         city_data = parsed["cities"].get(source_city.casefold())
+        # Copy shared city forecasts so site-specific red overrides cannot overwrite one another.
+        days = [dict(day) for day in city_data["days"]] if city_data else []
+        for day in days:
+            auto = automatic_severity(day["condition"])
+            red = bool(overrides.get(override_key(site, day["date"])))
+            day.update({
+                "forecast_window": FORECAST_WINDOW,
+                "automatic_severity": auto,
+                "severity": "red" if red else auto,
+                "red_override": red,
+            })
         rows.append({
             "region": region,
             "site": site,
             "source_city": source_city,
-            "days": city_data["days"] if city_data else [],
+            "days": days,
             "available": bool(city_data),
         })
     return {
@@ -117,7 +236,7 @@ def build_payload() -> dict:
 
 def forecast_sentence(day: dict) -> str:
     rain = f"{day['rain_chance']}% chance of rain" if day["rain_chance"] is not None else "Rain chance unavailable"
-    return f"{day['condition']}. Low {day['low']}, high {day['high']}; {rain}."
+    return f"{day['condition']}. Low {day['low']}, high {day['high']}; {rain}. Forecast window: {day['forecast_window']}."
 
 
 def export_workbook(payload: dict) -> BytesIO:
@@ -139,6 +258,17 @@ def export_workbook(payload: dict) -> BytesIO:
         values += [forecast_sentence(d) for d in row["days"][:5]]
         values += ["Forecast unavailable"] * (7 - len(values))
         ws.append(values)
+
+    severity_fills = {
+        "green": PatternFill("solid", fgColor="C6EFCE"),
+        "yellow": PatternFill("solid", fgColor="FFF2CC"),
+        "orange": PatternFill("solid", fgColor="F4B183"),
+        "red": PatternFill("solid", fgColor="FF6B6B"),
+        "none": PatternFill("solid", fgColor="F2F2F2"),
+    }
+    for row_index, row in enumerate(payload["rows"], start=2):
+        for day_index, day in enumerate(row["days"][:5], start=3):
+            ws.cell(row_index, day_index).fill = severity_fills[day["severity"]]
 
     navy, blue, white = "17365D", "D9EAF7", "FFFFFF"
     ws["B1"].fill = PatternFill("solid", fgColor=navy)
@@ -195,10 +325,54 @@ def forecast():
     return JSONResponse(build_payload())
 
 
+@app.get("/api/admin/status")
+def admin_status(request: Request):
+    return {"authenticated": is_admin(request), "configured": bool(os.getenv("ADMIN_PASSWORD_HASH"))}
+
+
+@app.post("/api/admin/login")
+def admin_login(payload: LoginPayload, response: Response):
+    if not os.getenv("ADMIN_PASSWORD_HASH"):
+        raise HTTPException(503, "Admin access is not configured.")
+    if not verify_password(payload.password):
+        raise HTTPException(401, "Incorrect admin password.")
+    response.set_cookie(
+        "pagasa_admin",
+        session_token(),
+        max_age=8 * 60 * 60,
+        httponly=True,
+        secure=bool(os.getenv("VERCEL")),
+        samesite="strict",
+    )
+    return {"authenticated": True}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(response: Response):
+    response.delete_cookie("pagasa_admin")
+    return {"authenticated": False}
+
+
+@app.put("/api/admin/override")
+def update_override(payload: OverridePayload, request: Request):
+    if not is_admin(request):
+        raise HTTPException(401, "Admin login required.")
+    valid_sites = {site.casefold() for _, site, _ in SITES}
+    if payload.site.casefold() not in valid_sites or not payload.date.strip():
+        raise HTTPException(400, "Invalid site or forecast date.")
+    data = load_overrides(force=True)
+    key = override_key(payload.site, payload.date)
+    if payload.red:
+        data[key] = {"red": True, "updated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+    else:
+        data.pop(key, None)
+    save_overrides(data)
+    return {"site": payload.site, "date": payload.date, "red_override": payload.red}
+
+
 @app.get("/api/export")
 def export():
     payload = build_payload()
     stream = export_workbook(payload)
     filename = f"PAGASA_5-Day_Forecast_{datetime.now():%Y%m%d}.xlsx"
     return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
