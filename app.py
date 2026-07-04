@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 SNAPSHOT = ROOT / "data" / "pagasa_selected_cities.html"
 PAGASA_URL = "https://www.pagasa.dost.gov.ph/weather/weather-outlook-selected-philippine-cities"
+PAGASA_WEEKLY_URL = "https://www.pagasa.dost.gov.ph/weather/weather-outlook-weekly"
 LOCAL_OVERRIDES = ROOT / "data" / "overrides.json"
 OVERRIDE_PREFIX = "pagasa-weather-overrides/"
 FORECAST_WINDOW = "8:00 AM – 8:00 AM next day"
@@ -68,6 +69,68 @@ def automatic_severity(condition: str) -> str:
     if any(word in text for word in ("light rain", "rainfall", "rainshowers", "rain", "thunderstorm")):
         return "green"
     return "none"
+
+
+def fetch_weekly_outlook() -> dict:
+    try:
+        response = requests.get(PAGASA_WEEKLY_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0 PAGASA-Weather-Tool/1.0"})
+        response.raise_for_status()
+        text = " ".join(BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True).replace("\xa0", " ").split())
+        issued = re.search(r"Issued at:\s*(.+?)\s+Valid until:", text, re.I)
+        valid = re.search(r"Valid until:\s*(.+?)\s+\d{1,2}(?:-\d{1,2})?\s+[A-Z]", text, re.I)
+        return {
+            "available": True,
+            "issued": issued.group(1) if issued else "Issue time unavailable",
+            "valid_until": valid.group(1) if valid else "",
+            "summary": text,
+            "source_url": PAGASA_WEEKLY_URL,
+        }
+    except requests.RequestException as exc:
+        return {"available": False, "summary": "", "source_url": PAGASA_WEEKLY_URL, "error": str(exc)}
+
+
+def weekly_context(site: str, date_text: str, condition: str, weekly: dict) -> dict:
+    """Merge risks explicitly named in PAGASA's weekly narrative.
+
+    This intentionally does not invent hourly probabilities. The weekly outlook
+    sometimes supplies a qualitative time of day and hazards omitted by the
+    selected-city table.
+    """
+    summary = weekly.get("summary", "").upper()
+    timing = FORECAST_WINDOW
+    alert = ""
+    alert_level = "none"
+    severity = automatic_severity(condition)
+    try:
+        date = datetime.strptime(date_text, "%A %B %d, %Y")
+    except ValueError:
+        date = None
+
+    if "AFTERNOON OR EVENING" in summary and "THUNDERSTORM" in condition.upper():
+        timing = "Afternoon to evening (PAGASA; exact hours unavailable)"
+
+    if date and "BAVI" in summary and date.month == 7 and date.day in (8, 9):
+        if site in {"Laoag", "Baguio"}:
+            alert = "BAVI / INDAY: rains with gusty winds possible"
+            alert_level = "cyclone"
+        if site == "Bacolod" and "NEGROS ISLAND REGION" in summary and "AT TIMES HEAVY RAINS" in summary:
+            severity = "orange"
+            alert = "Enhanced Habagat: light to moderate, at times heavy rain"
+            alert_level = "heavy-rain"
+        if site == "GenSan" and "SOCCSKSARGEN" in summary and "AT TIMES HEAVY RAINS" in summary:
+            severity = "orange"
+            alert = "Enhanced Habagat: light to moderate, at times heavy rain"
+            alert_level = "heavy-rain"
+
+    if date and "BAVI" in summary and date.month == 7 and date.day == 10:
+        if site in {"Laoag", "Baguio"}:
+            alert = "BAVI / INDAY: rains with gusty winds possible"
+            alert_level = "cyclone"
+        elif site in {"Clark", "Molino", "Bacolod", "GenSan"}:
+            alert = "Enhanced Habagat / monsoon rain risk"
+            alert_level = "monsoon"
+
+    return {"severity": severity, "forecast_window": timing, "weather_alert": alert, "alert_level": alert_level}
 
 
 def override_key(site: str, date: str) -> str:
@@ -203,6 +266,7 @@ def parse_pagasa(html: str) -> dict:
 def build_payload() -> dict:
     html, source_mode = fetch_html()
     parsed = parse_pagasa(html)
+    weekly = fetch_weekly_outlook()
     rows = []
     overrides = load_overrides()
     for region, site, source_city in SITES:
@@ -210,13 +274,16 @@ def build_payload() -> dict:
         # Copy shared city forecasts so site-specific red overrides cannot overwrite one another.
         days = [dict(day) for day in city_data["days"]] if city_data else []
         for day in days:
-            auto = automatic_severity(day["condition"])
+            context = weekly_context(site, day["date"], day["condition"], weekly)
+            auto = context["severity"]
             red = bool(overrides.get(override_key(site, day["date"])))
             day.update({
-                "forecast_window": FORECAST_WINDOW,
+                "forecast_window": context["forecast_window"],
                 "automatic_severity": auto,
                 "severity": "red" if red else auto,
                 "red_override": red,
+                "weather_alert": context["weather_alert"],
+                "alert_level": context["alert_level"],
             })
         rows.append({
             "region": region,
@@ -230,6 +297,7 @@ def build_payload() -> dict:
         "retrieved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source_mode": source_mode,
         "source_url": PAGASA_URL,
+        "weekly_outlook": weekly,
         "rows": rows,
     }
 

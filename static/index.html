@@ -1,57 +1,64 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>PAGASA 5-Day Weather Tool</title>
+  <title>PAGASA Weather Operations Dashboard</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <header class="hero">
-    <div>
-      <p class="eyebrow">DOST–PAGASA DATA VIEW</p>
-      <h1>5-Day Weather Forecast</h1>
-      <p id="issued">Loading the latest PAGASA forecast…</p>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">PW</span><div><strong>PAGASA Weather</strong><small>Operations Tool</small></div></div>
+      <nav>
+        <a class="nav-link active" href="#overview">▦ <span>Dashboard</span></a>
+        <a class="nav-link" href="#forecast">☂ <span>5-Day Forecast</span></a>
+        <a class="nav-link" href="#outlook">⚠ <span>Weather Outlook</span></a>
+      </nav>
+      <div class="sidebar-foot"><span class="live-dot"></span> PAGASA live sources<br><small>Automatic refresh: 30 minutes</small></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div><p class="eyebrow">WEATHER OPERATIONS</p><h1>Forecast Dashboard</h1></div>
+        <div class="actions">
+          <button id="theme-toggle" class="icon-button" aria-label="Toggle dark mode">☾</button>
+          <button id="admin-login">Admin</button>
+          <button id="refresh">Refresh</button>
+          <a class="button primary" href="/api/export">Export Excel</a>
+        </div>
+      </header>
+      <main>
+        <section id="overview" class="overview-grid">
+          <article class="summary-card"><span>Data status</span><strong id="status">Connecting…</strong><small id="retrieved"></small></article>
+          <article class="summary-card"><span>Forecast validity</span><strong id="issued">Loading…</strong><small>Official selected-city product</small></article>
+          <article class="summary-card"><span>Next update</span><strong id="next-refresh">30:00</strong><small>Auto-refresh interval</small></article>
+          <article class="summary-card risk"><span>Elevated cells</span><strong id="risk-count">—</strong><small>Moderate, heavy, cyclone or monsoon</small></article>
+        </section>
+
+        <section id="outlook" class="outlook-panel">
+          <div class="section-heading"><div><p class="eyebrow">PAGASA WEEKLY OUTLOOK</p><h2>Weather systems and hazards</h2></div><a id="outlook-source" target="_blank" rel="noopener">Official source ↗</a></div>
+          <div id="outlook-content" class="outlook-content">Loading the weekly weather outlook…</div>
+        </section>
+
+        <section id="forecast" class="forecast-panel">
+          <div class="section-heading"><div><p class="eyebrow">SITE MONITORING</p><h2>5-Day Forecast Matrix</h2></div></div>
+          <div class="legend" aria-label="Rainfall warning legend">
+            <span class="legend-label">Rainfall intensity</span>
+            <span class="legend-item green">Light / rainshowers</span>
+            <span class="legend-item yellow">Moderate</span>
+            <span class="legend-item orange">Heavy / at times heavy</span>
+            <span class="legend-item red">Admin RED override</span>
+          </div>
+          <div class="table-shell"><table><thead><tr id="head"><th>Region</th><th>Site</th></tr></thead><tbody id="forecast-body"></tbody></table></div>
+          <div class="notes">
+            <p><strong>Time window:</strong> The selected-city feed is daily. Where PAGASA’s weekly outlook identifies a time of day, the dashboard shows it (for example, “afternoon to evening”). Exact 2–6 PM probabilities are not published in this source.</p>
+            <p>Sites not individually published by PAGASA use the nearest selected-city outlook; the mapped source is shown per site.</p>
+          </div>
+        </section>
+      </main>
     </div>
-    <div class="actions">
-      <button id="admin-login">Admin</button>
-      <button id="refresh">Refresh data</button>
-      <a class="button primary" href="/api/export">Export Excel</a>
-    </div>
-  </header>
-  <main>
-    <section class="statusbar">
-      <span><span id="status">Connecting to PAGASA…</span> · <span id="next-refresh">Auto-refresh every 30 minutes</span></span>
-      <span id="retrieved"></span>
-    </section>
-    <section class="legend" aria-label="Rainfall warning legend">
-      <span class="legend-label">Warning level</span>
-      <span class="legend-item green">Light rain/rainfall</span>
-      <span class="legend-item yellow">Moderate rain/rainfall</span>
-      <span class="legend-item orange">Heavy rain/rainfall</span>
-      <span class="legend-item red">Torrential — admin override</span>
-    </section>
-    <section class="table-shell">
-      <table>
-        <thead><tr id="head"><th>Region</th><th>Site</th></tr></thead>
-        <tbody id="forecast-body"></tbody>
-      </table>
-    </section>
-    <p class="note">Sites not published individually by PAGASA use the nearest available selected-city outlook. The source city is shown below each site.</p>
-    <p class="note"><strong>Timing:</strong> PAGASA’s selected-city product supplies daily forecasts, not rainfall start/end hours. Each box therefore shows the official 8:00 AM–8:00 AM next-day forecast window.</p>
-  </main>
-  <dialog id="admin-dialog">
-    <form id="admin-form" method="dialog">
-      <button class="dialog-close" type="button" aria-label="Close">×</button>
-      <p class="eyebrow dark">RESTRICTED CONTROL</p>
-      <h2>Admin access</h2>
-      <p>Sign in to apply or remove red warnings.</p>
-      <label for="admin-password">Password</label>
-      <input id="admin-password" type="password" autocomplete="current-password" required>
-      <p id="admin-error" class="form-error" role="alert"></p>
-      <button class="dialog-submit" type="submit">Sign in</button>
-    </form>
-  </dialog>
+  </div>
+  <dialog id="admin-dialog"><form id="admin-form" method="dialog"><button class="dialog-close" type="button" aria-label="Close">×</button><p class="eyebrow">RESTRICTED CONTROL</p><h2>Admin access</h2><p>Sign in to apply or remove RED overrides.</p><label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password" required><p id="admin-error" class="form-error" role="alert"></p><button class="dialog-submit" type="submit">Sign in</button></form></dialog>
   <script src="/static/app.js"></script>
 </body>
 </html>
