@@ -77,7 +77,7 @@ def fetch_weekly_outlook() -> dict:
         response.raise_for_status()
         text = " ".join(BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True).replace("\xa0", " ").split())
         issued = re.search(r"Issued at:\s*(.+?)\s+Valid until:", text, re.I)
-        valid = re.search(r"Valid until:\s*(.+?)\s+\d{1,2}(?:-\d{1,2})?\s+[A-Z]", text, re.I)
+        valid = re.search(r"Valid until:\s*(\d{1,2}:\d{2}\s*[AP]M,\s*\d{1,2}\s+[A-Za-z]+\s+\d{4})", text, re.I)
         return {
             "available": True,
             "issued": issued.group(1) if issued else "Issue time unavailable",
