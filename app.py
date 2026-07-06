@@ -1,386 +1,635 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import re
-import shutil
-import sqlite3
-import urllib.request
-from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import datetime
+from calendar import monthrange
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import time
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+import requests
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from playwright.async_api import async_playwright
-try:
-    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-    import pytesseract
-except ImportError:
-    Image = ImageEnhance = ImageFilter = ImageOps = pytesseract = None
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = ROOT / "data" / "interruptions.db"
-FB_PROFILE = ROOT / "data" / "facebook-profile"
-FB_MARKER = ROOT / "data" / ".facebook_connected"
-REFRESH_MINUTES = int(os.getenv("REFRESH_MINUTES", "60"))
-POST_LIMIT = int(os.getenv("POST_LIMIT", "20"))
+STATIC = ROOT / "static"
+SNAPSHOT = ROOT / "data" / "pagasa_selected_cities.html"
+PAGASA_URL = "https://www.pagasa.dost.gov.ph/weather/weather-outlook-selected-philippine-cities"
+PAGASA_WEEKLY_URL = "https://www.pagasa.dost.gov.ph/weather/weather-outlook-weekly"
+PAGASA_DAILY_URL = "https://www.pagasa.dost.gov.ph/weather"
+PANAHON_URL = "https://www.panahon.gov.ph/"
+LOCAL_OVERRIDES = ROOT / "data" / "overrides.json"
+OVERRIDE_PREFIX = "pagasa-weather-overrides/"
+FORECAST_WINDOW = "8:00 AM – 8:00 AM next day"
+_override_cache = {"loaded_at": 0.0, "data": {}}
 
-PROVIDERS = [
-    ("BENECO", "Baguio / Benguet", "https://www.facebook.com/benguetelectric"),
-    ("CEBECO I", "Cebu", "https://www.facebook.com/cebu1EC"),
-    ("CEBECO II", "Cebu", "https://www.facebook.com/cebeco2.official"),
-    ("CEBECO III", "Cebu", "https://www.facebook.com/CEBECOIIIToledo"),
-    ("CEPALCO", "Cagayan de Oro", "https://www.facebook.com/cepalcoofficial"),
-    ("Davao Light and Power Co.", "Davao", "https://www.facebook.com/DavaoLightOfficial"),
-    ("INEC", "Ilocos Norte", "https://www.facebook.com/INECofficial"),
-    ("MECO", "Mactan", "https://www.facebook.com/mecomactan"),
-    ("MERALCO", "Metro Manila / service area", "https://www.facebook.com/meralco"),
-    ("Negros Power", "Negros Occidental", "https://www.facebook.com/negrospowerph"),
-    ("PELCO I", "Pampanga", "https://www.facebook.com/pelco1officialpage"),
-    ("PELCO II", "Pampanga", "https://www.facebook.com/Pelco2"),
-    ("PELCO III", "Pampanga", "https://www.facebook.com/pelco3official"),
-    ("SOCOTECO I", "South Cotabato", "https://www.facebook.com/socoteco1.koronadal"),
-    ("SOCOTECO II", "General Santos / Sarangani", "https://www.facebook.com/socoteco2.EC"),
-    ("VECO", "Cebu", "https://www.facebook.com/visayanelectriccompany"),
+SITES = [
+    ("LUZON", "Alabang", "Metro Manila"),
+    ("", "Antipolo", "Metro Manila"),
+    ("", "Baguio", "Baguio City"),
+    ("", "Clark", "Sbma (Olongapo)"),
+    ("", "Laoag", "Laoag City"),
+    ("", "Metro Manila", "Metro Manila"),
+    ("", "Molino", "Tagaytay City"),
+    ("VISAYAS", "Bacolod", "Bacolod City"),
+    ("", "Cebu", "Metro Cebu"),
+    ("MINDANAO", "CDO", "Cagayan De Oro City"),
+    ("", "Davao", "Metro Davao"),
+    ("", "GenSan", "Metro Davao"),
 ]
 
-KEYWORDS = re.compile(r"power interruption|service interruption|scheduled interruption|brownout|maintenance schedule|power advisory|cancelled|canceled|rescheduled", re.I)
-CANCELLED = re.compile(r"\b(cancelled|canceled|cancellation|will no longer push through|called off)\b", re.I)
-RESCHEDULED = re.compile(r"\b(rescheduled|moved to|new schedule)\b", re.I)
-DATE_PATTERNS = [
-    re.compile(r"(?:date\s*[:\-]?\s*)?((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+20\d{2})", re.I),
-    re.compile(r"(?:date\s*[:\-]?\s*)?(20\d{2}[-/]\d{1,2}[-/]\d{1,2})", re.I),
-]
-TIME_RE = re.compile(r"(?:time\s*[:\-]?\s*)?((?:\d{1,2}:\d{2}|\d{1,2})\s*(?:AM|PM)?)\s*(?:to|\-|–|until)\s*((?:\d{1,2}:\d{2}|\d{1,2})\s*(?:AM|PM)?)", re.I)
+SITE_COORDS = {
+    "Alabang": (14.419, 121.044), "Antipolo": (14.586, 121.176),
+    "Baguio": (16.402, 120.596), "Clark": (15.186, 120.560),
+    "Laoag": (18.198, 120.594), "Metro Manila": (14.599, 120.984),
+    "Molino": (14.396, 120.974), "Bacolod": (10.676, 122.951),
+    "Cebu": (10.315, 123.885), "CDO": (8.454, 124.632),
+    "Davao": (7.190, 125.455), "GenSan": (6.116, 125.171),
+}
+OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+
+app = FastAPI(title="PAGASA 5-Day Weather Tool")
+app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
-def db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+class LoginPayload(BaseModel):
+    password: str
 
 
-def init_db() -> None:
-    with db() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS interruptions (
-          id INTEGER PRIMARY KEY, provider TEXT NOT NULL, site TEXT NOT NULL,
-          event_date TEXT, start_time TEXT, end_time TEXT, location TEXT,
-          reason TEXT, status TEXT NOT NULL DEFAULT 'Scheduled', raw_text TEXT,
-          source_url TEXT NOT NULL, image_url TEXT, source_post_id TEXT,
-          confidence REAL NOT NULL DEFAULT 0, scraped_at TEXT NOT NULL,
-          UNIQUE(provider, source_url, event_date, start_time, location)
-        );
-        CREATE TABLE IF NOT EXISTS runs (
-          id INTEGER PRIMARY KEY, provider TEXT NOT NULL, started_at TEXT NOT NULL,
-          finished_at TEXT, status TEXT NOT NULL, posts_seen INTEGER DEFAULT 0,
-          records_found INTEGER DEFAULT 0, message TEXT
-        );
-        CREATE INDEX IF NOT EXISTS ix_interruptions_date ON interruptions(event_date);
-        """)
+class OverridePayload(BaseModel):
+    site: str
+    date: str
+    red: bool
 
 
-def clean_text(value: str) -> str:
-    return re.sub(r"[ \t]+", " ", re.sub(r"\r", "", value or "")).strip()
+def automatic_severity(condition: str) -> str:
+    text = condition.casefold()
+    if any(word in text for word in ("torrential", "heavy", "intense")):
+        return "orange"
+    if "moderate" in text:
+        return "yellow"
+    if any(word in text for word in ("light rain", "rainfall", "rainshowers", "rain", "thunderstorm")):
+        return "green"
+    return "none"
 
 
-def parse_date(text: str) -> str | None:
-    for pattern in DATE_PATTERNS:
-        match = pattern.search(text)
-        if not match:
-            continue
-        raw = match.group(1).replace("/", "-")
-        for fmt in ("%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(raw, fmt).date().isoformat()
-            except ValueError:
-                pass
-    return None
+def fetch_weekly_outlook() -> dict:
+    try:
+        response = requests.get(PAGASA_WEEKLY_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0 PAGASA-Weather-Tool/1.0"})
+        response.raise_for_status()
+        text = " ".join(BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True).replace("\xa0", " ").split())
+        issued = re.search(r"Issued at:\s*(.+?)\s+Valid until:", text, re.I)
+        valid = re.search(r"Valid until:\s*(\d{1,2}:\d{2}\s*[AP]M,\s*\d{1,2}\s+[A-Za-z]+\s+\d{4})", text, re.I)
+        return {
+            "available": True,
+            "issued": issued.group(1) if issued else "Issue time unavailable",
+            "valid_until": valid.group(1) if valid else "",
+            "summary": text,
+            "source_url": PAGASA_WEEKLY_URL,
+        }
+    except requests.RequestException as exc:
+        return {"available": False, "summary": "", "source_url": PAGASA_WEEKLY_URL, "error": str(exc)}
 
 
-def field(text: str, label: str, following: tuple[str, ...]) -> str:
-    stop = "|".join(re.escape(x) for x in following)
-    match = re.search(rf"{label}\s*[:\-]\s*(.+?)(?=\s+(?:{stop})\s*[:\-]|$)", text, re.I | re.S)
-    return clean_text(match.group(1)) if match else ""
+def weekly_context(site: str, date_text: str, condition: str, weekly: dict) -> dict:
+    """Merge risks explicitly named in PAGASA's weekly narrative.
 
+    This intentionally does not invent hourly probabilities. The weekly outlook
+    sometimes supplies a qualitative time of day and hazards omitted by the
+    selected-city table.
+    """
+    summary = weekly.get("summary", "").upper()
+    timing = FORECAST_WINDOW
+    alert = ""
+    alert_level = "none"
+    severity = automatic_severity(condition)
+    try:
+        date = datetime.strptime(date_text, "%A %B %d, %Y")
+    except ValueError:
+        date = None
 
-def parse_record(provider: str, site: str, text: str, source_url: str, image_url: str | None) -> dict[str, Any] | None:
-    text = clean_text(text)
-    if not KEYWORDS.search(text) and not (parse_date(text) and TIME_RE.search(text)):
-        return None
-    status = "Cancelled" if CANCELLED.search(text) else "Rescheduled" if RESCHEDULED.search(text) else "Scheduled"
-    time_match = TIME_RE.search(text)
-    event_date = parse_date(text)
-    location = field(text, "(?:location|affected areas?|areas? affected)", ("reason", "purpose", "date", "time", "status"))
-    reason = field(text, "(?:reason|purpose)", ("date", "time", "location", "affected area", "status"))
-    confidence = sum([bool(event_date), bool(time_match), bool(location)]) / 3
+    if "AFTERNOON OR EVENING" in summary and "THUNDERSTORM" in condition.upper():
+        timing = "Afternoon to evening (PAGASA; exact hours unavailable)"
+
+    if date and "BAVI" in summary and date.month == 7 and date.day in (8, 9):
+        if site in {"Laoag", "Baguio"}:
+            alert = "BAVI / INDAY: rains with gusty winds possible"
+            alert_level = "cyclone"
+        if site == "Bacolod" and "NEGROS ISLAND REGION" in summary and "AT TIMES HEAVY RAINS" in summary:
+            severity = "orange"
+            alert = "Enhanced Habagat: light to moderate, at times heavy rain"
+            alert_level = "heavy-rain"
+        if site == "GenSan" and "SOCCSKSARGEN" in summary and "AT TIMES HEAVY RAINS" in summary:
+            severity = "orange"
+            alert = "Enhanced Habagat: light to moderate, at times heavy rain"
+            alert_level = "heavy-rain"
+
+    if date and "BAVI" in summary and date.month == 7 and date.day == 10:
+        if site in {"Laoag", "Baguio"}:
+            alert = "BAVI / INDAY: rains with gusty winds possible"
+            alert_level = "cyclone"
+        elif site in {"Clark", "Molino", "Bacolod", "GenSan"}:
+            alert = "Enhanced Habagat / monsoon rain risk"
+            alert_level = "monsoon"
+
     return {
-        "provider": provider, "site": site, "event_date": event_date,
-        "start_time": clean_text(time_match.group(1)) if time_match else None,
-        "end_time": clean_text(time_match.group(2)) if time_match else None,
-        "location": location or "Needs review", "reason": reason,
-        "status": status, "raw_text": text, "source_url": source_url,
-        "image_url": image_url, "confidence": confidence,
-        "scraped_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "severity": severity,
+        "forecast_window": timing,
+        "weather_alert": alert,
+        "alert_level": alert_level,
+        "overlay_source": "PAGASA weekly regional outlook" if alert else "",
     }
 
 
-def tesseract_path() -> str | None:
-    if pytesseract is None:
-        return None
-    configured = os.getenv("TESSERACT_CMD")
-    candidates = [configured, shutil.which("tesseract"), r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"]
-    return next((str(path) for path in candidates if path and Path(path).exists()), None)
-
-
-def _image_ocr_sync(image_url: str) -> str:
-    executable = tesseract_path()
-    if not executable:
-        return ""
+def fetch_current_situation() -> dict:
     try:
-        with urllib.request.urlopen(image_url, timeout=25) as response:
-            raw = response.read()
-        image = Image.open(BytesIO(raw)).convert("RGB")
-        if image.width < 1800:
-            ratio = 1800 / image.width
-            image = image.resize((1800, int(image.height * ratio)), Image.Resampling.LANCZOS)
-        image = ImageOps.grayscale(image)
-        image = ImageOps.autocontrast(image)
-        image = ImageEnhance.Contrast(image).enhance(1.6)
-        image = image.filter(ImageFilter.SHARPEN)
-        pytesseract.pytesseract.tesseract_cmd = executable
-        return clean_text(pytesseract.image_to_string(image, lang="eng", config="--oem 3 --psm 6"))
-    except Exception:
-        return ""
+        response = requests.get(PAGASA_DAILY_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0 PAGASA-Weather-Tool/1.0"})
+        response.raise_for_status()
+        html = response.content.decode("utf-8", errors="replace")
+        text = " ".join(BeautifulSoup(html, "html.parser").get_text(" ", strip=True).replace("\xa0", " ").replace("�", "°").split())
+
+        def value(label: str, following: str) -> str:
+            match = re.search(rf"{label}:?\s*(.+?)(?=\s+(?:{following}))", text, re.I)
+            return match.group(1).strip() if match else "Unavailable"
+
+        issued = re.search(r"Issued at:\s*(.+?)(?=\s+Synopsis)", text, re.I)
+        synopsis = value("Synopsis", "TC Information|Forecast Weather Conditions")
+        tc_block = re.search(r"TC Information\s+(.+?)(?=\s+Forecast Weather Conditions)", text, re.I)
+        tc_text = tc_block.group(1).strip() if tc_block else "No tropical cyclone information published in the daily forecast."
+        name_match = re.search(r"((?:SUPER\s+)?TYPHOON|TROPICAL STORM|SEVERE TROPICAL STORM|TROPICAL DEPRESSION)\s+([A-Z0-9() -]+?)(?=\s+LOCATION:)", tc_text, re.I)
+        return {
+            "available": True,
+            "issued": issued.group(1).strip() if issued else "Issue time unavailable",
+            "synopsis": synopsis,
+            "tc_status": re.sub(r"\s+", " ", tc_text),
+            "tc_name": " ".join(name_match.groups()).title() if name_match else "No named cyclone in daily forecast",
+            "location": value("LOCATION", "MAXIMUM SUSTAINED WINDS"),
+            "winds": value("MAXIMUM SUSTAINED WINDS", "GUSTINESS"),
+            "gustiness": value("GUSTINESS", "MOVEMENT"),
+            "movement": value("MOVEMENT", "Forecast Weather Conditions"),
+            "source_url": PAGASA_DAILY_URL,
+            "map_url": PANAHON_URL,
+            "retrieved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+    except requests.RequestException as exc:
+        return {"available": False, "error": str(exc), "source_url": PAGASA_DAILY_URL, "map_url": PANAHON_URL}
 
 
-async def image_ocr(image_url: str) -> str:
-    return await asyncio.to_thread(_image_ocr_sync, image_url)
+def fetch_historical_summary(site: str, month: int) -> dict:
+    if site not in SITE_COORDS:
+        raise HTTPException(400, "Unknown site.")
+    if month < 1 or month > 12:
+        raise HTTPException(400, "Month must be between 1 and 12.")
 
+    now = datetime.now().astimezone()
+    newest_year = now.year if month <= now.month else now.year - 1
+    years = list(range(newest_year - 4, newest_year + 1))
+    start_date = f"{years[0]}-{month:02d}-01"
+    final_day = monthrange(years[-1], month)[1]
+    if years[-1] == now.year and month == now.month:
+        final_day = max(1, min(final_day, now.day - 5))
+    end_date = f"{years[-1]}-{month:02d}-{final_day:02d}"
+    latitude, longitude = SITE_COORDS[site]
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_gusts_10m_max,weather_code",
+        "timezone": "Asia/Manila",
+        "wind_speed_unit": "kmh",
+        "precipitation_unit": "mm",
+    }
+    try:
+        response = requests.get(OPEN_METEO_ARCHIVE, params=params, timeout=35, headers={"User-Agent": "Teleperformance-Weather-History/1.0"})
+        response.raise_for_status()
+        daily = response.json().get("daily", {})
+    except (requests.RequestException, ValueError) as exc:
+        raise HTTPException(503, f"Historical weather source is temporarily unavailable: {exc}")
 
-def facebook_profile() -> str | None:
-    configured = os.getenv("FACEBOOK_PROFILE_DIR")
-    if configured:
-        return configured
-    return str(FB_PROFILE) if FB_MARKER.exists() else None
+    records = []
+    keys = ["time", "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "wind_gusts_10m_max", "weather_code"]
+    arrays = [daily.get(key, []) for key in keys]
+    for values in zip(*arrays):
+        date_text, high, low, rain, gust, code = values
+        date = datetime.strptime(date_text, "%Y-%m-%d")
+        if date.month == month and date.year in years:
+            records.append({"date": date_text, "year": date.year, "high": high, "low": low, "rain": rain or 0, "gust": gust or 0, "code": code})
 
-
-connect_lock = asyncio.Lock()
-
-
-async def connect_facebook() -> None:
-    async with connect_lock:
-        FB_PROFILE.mkdir(parents=True, exist_ok=True)
-        async with async_playwright() as pw:
-            context = await pw.chromium.launch_persistent_context(
-                str(FB_PROFILE), headless=False, locale="en-PH", timezone_id="Asia/Manila"
-            )
-            page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60000)
-            for _ in range(300):
-                cookies = await context.cookies("https://www.facebook.com")
-                if any(cookie.get("name") == "c_user" for cookie in cookies):
-                    FB_MARKER.write_text(datetime.now().astimezone().isoformat(), encoding="utf-8")
-                    break
-                await page.wait_for_timeout(2000)
-            await context.close()
-
-
-async def scrape_provider(name: str, site: str, url: str) -> tuple[int, list[dict[str, Any]]]:
-    profile = facebook_profile()
-    async with async_playwright() as pw:
-        if profile:
-            context = await pw.chromium.launch_persistent_context(
-                profile, headless=True, locale="en-PH", timezone_id="Asia/Manila",
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            page = context.pages[0] if context.pages else await context.new_page()
+    summaries = []
+    for year in years:
+        items = [item for item in records if item["year"] == year]
+        if not items:
+            summaries.append({"year": year, "available": False})
+            continue
+        rainiest = max(items, key=lambda item: item["rain"])
+        windiest = max(items, key=lambda item: item["gust"])
+        critical = sorted(
+            [item for item in items if item["rain"] >= 50 or item["gust"] >= 62 or item["code"] in (95, 96, 99)],
+            key=lambda item: max(item["rain"] / 50, item["gust"] / 62), reverse=True,
+        )[:6]
+        if rainiest["rain"] >= 100:
+            headline = "Extreme daily rainfall signal in the local reanalysis."
+        elif rainiest["rain"] >= 50:
+            headline = "At least one heavy-rain day in the local reanalysis."
+        elif windiest["gust"] >= 62:
+            headline = "At least one strong-gust day in the local reanalysis."
         else:
-            browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context(locale="en-PH", timezone_id="Asia/Manila")
-            page = await context.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(3500)
-        await page.evaluate("window.scrollBy(0, 900)")
-        await page.wait_for_timeout(1500)
-        posts = await page.locator("[role='article'], div[data-pagelet^='FeedUnit_']").all()
-        if not posts:
-            mobile_url = url.replace("www.facebook.com", "m.facebook.com")
-            await page.goto(mobile_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3000)
-            posts = await page.locator("[role='article'], article").all()
-        output: list[dict[str, Any]] = []
-        for article in posts[:POST_LIMIT]:
-            text = clean_text(await article.inner_text())
-            links = await article.locator("a[href*='/posts/'], a[href*='story_fbid'], a[href*='/photos/']").all()
-            source_url = await links[0].get_attribute("href") if links else url
-            if source_url and source_url.startswith("/"):
-                source_url = "https://www.facebook.com" + source_url
-            images = await article.locator("img").all()
-            image_url = None
-            for image in images:
-                candidate = await image.get_attribute("src")
-                if candidate and ("scontent" in candidate or "fbcdn" in candidate):
-                    image_url = candidate
-                    break
-            combined = text
-            if image_url and (KEYWORDS.search(text) or len(text) < 300):
-                combined += "\n" + await image_ocr(image_url)
-            record = parse_record(name, site, combined, source_url or url, image_url)
-            if record:
-                output.append(record)
-        await context.close()
-        return len(posts), output
+            headline = "No day crossed the dashboard's heavy-rain or strong-gust screening threshold."
+        summaries.append({
+            "year": year, "available": True, "days": len(items),
+            "partial": year == now.year and month == now.month,
+            "total_rain": round(sum(item["rain"] for item in items), 1),
+            "wet_days": sum(item["rain"] >= 1 for item in items),
+            "heavy_days": sum(item["rain"] >= 50 for item in items),
+            "avg_high": round(sum(item["high"] for item in items) / len(items), 1),
+            "avg_low": round(sum(item["low"] for item in items) / len(items), 1),
+            "max_daily_rain": round(rainiest["rain"], 1), "rainiest_date": rainiest["date"],
+            "max_gust": round(windiest["gust"], 1), "windiest_date": windiest["date"],
+            "critical_days": critical, "headline": headline,
+        })
+    return {
+        "site": site, "month": month, "month_name": datetime(2000, month, 1).strftime("%B"),
+        "years": years, "summaries": summaries, "latitude": latitude, "longitude": longitude,
+        "source": "Open-Meteo Historical Weather API (ERA5 reanalysis)",
+        "source_url": "https://open-meteo.com/en/docs/historical-weather-api",
+        "pagasa_annual_url": "https://www.pagasa.dost.gov.ph/tropical-cyclone/publications/annual-report",
+        "pagasa_preliminary_url": "https://www.pagasa.dost.gov.ph/tropical-cyclone/publications/preliminary-report",
+        "retrieved_at": now.isoformat(timespec="seconds"),
+        "note": "Reanalysis identifies local weather signals, not cyclone causation. Verify named tropical cyclones in PAGASA reports.",
+    }
 
 
-def save_records(records: list[dict[str, Any]]) -> int:
-    count = 0
-    with db() as conn:
-        for item in records:
-            if item["status"] == "Cancelled" and item["event_date"]:
-                # Cancellation advisories are often separate Facebook posts. Preserve
-                # the advisory and also mark the earlier schedule for that provider/date.
-                conn.execute("""UPDATE interruptions SET status='Cancelled', scraped_at=?
-                    WHERE provider=? AND event_date=? AND status!='Cancelled'
-                    AND (?='Needs review' OR location LIKE '%' || ? || '%' OR ? LIKE '%' || location || '%')""",
-                    (item["scraped_at"], item["provider"], item["event_date"], item["location"], item["location"], item["location"]))
-            before = conn.total_changes
-            conn.execute("""INSERT INTO interruptions
-              (provider,site,event_date,start_time,end_time,location,reason,status,raw_text,source_url,image_url,confidence,scraped_at)
-              VALUES (:provider,:site,:event_date,:start_time,:end_time,:location,:reason,:status,:raw_text,:source_url,:image_url,:confidence,:scraped_at)
-              ON CONFLICT(provider,source_url,event_date,start_time,location) DO UPDATE SET
-                status=excluded.status, reason=excluded.reason, raw_text=excluded.raw_text,
-                image_url=excluded.image_url, confidence=excluded.confidence, scraped_at=excluded.scraped_at""", item)
-            count += conn.total_changes - before
-    return count
+def override_key(site: str, date: str) -> str:
+    return f"{site.strip().casefold()}|{date.strip().casefold()}"
 
 
-refresh_lock = asyncio.Lock()
+def _local_overrides() -> dict:
+    try:
+        return json.loads(LOCAL_OVERRIDES.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 
-async def refresh_all() -> None:
-    if refresh_lock.locked() or connect_lock.locked():
-        return
-    async with refresh_lock:
-        for name, site, url in PROVIDERS:
-            started = datetime.now().astimezone().isoformat(timespec="seconds")
-            with db() as conn:
-                run_id = conn.execute("INSERT INTO runs(provider,started_at,status) VALUES (?,?,?)", (name, started, "Running")).lastrowid
-            try:
-                seen, records = await scrape_provider(name, site, url)
-                saved = save_records(records)
-                status, message = ("Complete", f"{saved} records updated") if seen else ("Blocked", "No public posts visible; configure FACEBOOK_PROFILE_DIR")
-            except Exception as exc:
-                seen, records, status, message = 0, [], "Failed", str(exc)[:500]
-            with db() as conn:
-                conn.execute("UPDATE runs SET finished_at=?,status=?,posts_seen=?,records_found=?,message=? WHERE id=?", (datetime.now().astimezone().isoformat(timespec="seconds"), status, seen, len(records), message, run_id))
+def load_overrides(force: bool = False) -> dict:
+    now = time.time()
+    if not force and now - _override_cache["loaded_at"] < 10:
+        return dict(_override_cache["data"])
+    if not os.getenv("BLOB_READ_WRITE_TOKEN"):
+        data = _local_overrides()
+    else:
+        try:
+            from vercel.blob import list_objects
+
+            result = list_objects(prefix=OVERRIDE_PREFIX, limit=100)
+            latest = max(result.blobs, key=lambda item: item.uploaded_at, default=None)
+            data = requests.get(latest.url, params={"v": int(now)}, timeout=10).json() if latest else {}
+        except Exception:
+            data = dict(_override_cache["data"])
+    _override_cache.update({"loaded_at": now, "data": data})
+    return dict(data)
 
 
-async def scheduler() -> None:
-    await asyncio.sleep(3)
-    while True:
-        await refresh_all()
-        await asyncio.sleep(max(5, REFRESH_MINUTES) * 60)
+def save_overrides(data: dict) -> None:
+    if os.getenv("BLOB_READ_WRITE_TOKEN"):
+        from vercel.blob import BlobClient
+
+        filename = f"{OVERRIDE_PREFIX}{int(time.time() * 1000)}-{secrets.token_hex(4)}.json"
+        BlobClient().put(
+            filename,
+            json.dumps(data, separators=(",", ":")).encode("utf-8"),
+            access="public",
+            content_type="application/json",
+            cache_control_max_age=60,
+        )
+    else:
+        LOCAL_OVERRIDES.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _override_cache.update({"loaded_at": time.time(), "data": dict(data)})
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    init_db()
-    task = None if os.getenv("DISABLE_SCHEDULER") == "1" else asyncio.create_task(scheduler())
-    yield
-    if task:
-        task.cancel()
+def verify_password(password: str) -> bool:
+    encoded = os.getenv("ADMIN_PASSWORD_HASH", "")
+    try:
+        iterations_text, salt_hex, expected_hex = encoded.split("$", 2)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations_text))
+        return hmac.compare_digest(actual.hex(), expected_hex)
+    except (TypeError, ValueError):
+        return False
 
 
-app = FastAPI(title="PowerWatch PH", lifespan=lifespan)
+def session_token() -> str:
+    expires = int(time.time()) + 8 * 60 * 60
+    secret = os.getenv("ADMIN_SESSION_SECRET", "")
+    signature = hmac.new(secret.encode(), str(expires).encode(), hashlib.sha256).hexdigest()
+    return f"{expires}.{signature}"
 
 
-@app.get("/api/interruptions")
-def interruptions(status: str | None = None, provider: str | None = None, start: str | None = None, end: str | None = None):
-    clauses, args = [], []
-    for column, value in (("status", status), ("provider", provider)):
-        if value:
-            clauses.append(f"{column}=?"); args.append(value)
-    if start: clauses.append("event_date>=?"); args.append(start)
-    if end: clauses.append("event_date<=?"); args.append(end)
-    where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    with db() as conn:
-        rows = conn.execute("SELECT * FROM interruptions" + where + " ORDER BY event_date,start_time,provider", args).fetchall()
-    return [dict(row) for row in rows]
+def is_admin(request: Request) -> bool:
+    token = request.cookies.get("pagasa_admin", "")
+    secret = os.getenv("ADMIN_SESSION_SECRET", "")
+    try:
+        expires_text, signature = token.split(".", 1)
+        expected = hmac.new(secret.encode(), expires_text.encode(), hashlib.sha256).hexdigest()
+        return bool(secret) and int(expires_text) > int(time.time()) and hmac.compare_digest(signature, expected)
+    except (TypeError, ValueError):
+        return False
 
 
-@app.get("/api/status")
-def scrape_status():
-    with db() as conn:
-        runs = conn.execute("""SELECT r.* FROM runs r JOIN (SELECT provider,MAX(id) id FROM runs GROUP BY provider) x ON x.id=r.id ORDER BY provider""").fetchall()
-        counts = conn.execute("SELECT status,COUNT(*) count FROM interruptions GROUP BY status").fetchall()
-    return {"refreshing": refresh_lock.locked(), "connecting": connect_lock.locked(),
-            "facebook_connected": bool(os.getenv("FACEBOOK_PROFILE_DIR") or FB_MARKER.exists()),
-            "refresh_minutes": REFRESH_MINUTES,
-            "ocr": {"available": bool(tesseract_path()), "engine": "Local Tesseract"},
-            "runs": [dict(r) for r in runs], "counts": {r["status"]: r["count"] for r in counts}}
+def fetch_html() -> tuple[str, str]:
+    try:
+        response = requests.get(PAGASA_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0 PAGASA-Weather-Tool/1.0"})
+        response.raise_for_status()
+        return response.text, "live"
+    except requests.RequestException:
+        if SNAPSHOT.exists():
+            return SNAPSHOT.read_text(encoding="utf-8"), "saved snapshot"
+        raise HTTPException(503, "PAGASA is temporarily unavailable and no saved snapshot exists.")
 
 
-@app.post("/api/refresh")
-async def trigger_refresh(background: BackgroundTasks):
-    if refresh_lock.locked():
-        return JSONResponse({"message": "Refresh already running"}, status_code=202)
-    background.add_task(refresh_all)
-    return JSONResponse({"message": "Refresh started"}, status_code=202)
+def clean_text(node) -> str:
+    return " ".join(node.get_text(" ", strip=True).replace("\xa0", " ").split())
 
 
-@app.post("/api/facebook/connect")
-async def start_facebook_connection(background: BackgroundTasks):
-    if refresh_lock.locked():
-        return JSONResponse({"message": "Wait for the current refresh to finish"}, status_code=409)
-    if connect_lock.locked():
-        return JSONResponse({"message": "Facebook sign-in is already open"}, status_code=202)
-    background.add_task(connect_facebook)
-    return JSONResponse({"message": "Facebook sign-in window opened. Log in there, then close it after the dashboard shows Connected."}, status_code=202)
+def parse_pagasa(html: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    outlook = soup.select_one("#outlook-phil-cities")
+    if not outlook:
+        raise HTTPException(502, "PAGASA page format changed; forecast section was not found.")
+
+    issue = soup.select_one(".validity")
+    issued = clean_text(issue) if issue else "Issue time unavailable"
+    cities = {}
+    for panel in outlook.select(".panel.panel-default"):
+        title = panel.select_one(".panel-title a")
+        table = panel.select_one("table")
+        if not title or not table:
+            continue
+        city = clean_text(title).replace("›", "").strip()
+        headers = [clean_text(th) for th in table.select("thead.desktop-view-thead th")]
+        desktop = table.select_one("tbody tr.desktop-view-tr")
+        if not desktop:
+            continue
+        days = []
+        for header, cell in zip(headers, desktop.select("td")):
+            image = cell.select_one("img")
+            condition = image.get("title", "Forecast unavailable") if image else "Forecast unavailable"
+            low = clean_text(cell.select_one(".min")) if cell.select_one(".min") else "—"
+            high = clean_text(cell.select_one(".max")) if cell.select_one(".max") else "—"
+            rain_node = next((s for s in cell.select("span") if "Chance of rain" in clean_text(s)), None)
+            rain_text = clean_text(rain_node) if rain_node else "Chance of rain: —"
+            rain_match = re.search(r"(\d+)%", rain_text)
+            days.append({
+                "date": header,
+                "condition": condition,
+                "low": low,
+                "high": high,
+                "rain_chance": int(rain_match.group(1)) if rain_match else None,
+                "icon": image.get("src") if image else None,
+            })
+        cities[city.casefold()] = {"name": city, "days": days}
+    return {"issued": issued, "cities": cities}
 
 
-@app.get("/api/export.xlsx")
-def export_xlsx(start: str = Query(default_factory=lambda: date.today().isoformat()), days: int = Query(7, ge=1, le=366)):
-    start_date = date.fromisoformat(start)
-    end_date = start_date + timedelta(days=days - 1)
-    with db() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM interruptions WHERE event_date BETWEEN ? AND ? ORDER BY provider,event_date", (start_date.isoformat(), end_date.isoformat()))]
-    wb = Workbook(); summary = wb.active; summary.title = "Summary"
-    headers = ["Power Provider", "Site"] + [(start_date + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
-    summary.append(headers)
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in rows: grouped.setdefault(row["provider"], []).append(row)
-    for name, site, _ in PROVIDERS:
-        cells = [name, site]
-        for i in range(days):
-            target = (start_date + timedelta(days=i)).isoformat()
-            items = [r for r in grouped.get(name, []) if r["event_date"] == target]
-            cells.append("\n\n".join(f"Status: {r['status']}\nLocation: {r['location']}\nTime: {r['start_time'] or ''} to {r['end_time'] or ''}\nReason: {r['reason'] or ''}" for r in items))
-        summary.append(cells)
-    fill = PatternFill("solid", fgColor="17324D")
-    for cell in summary[1]: cell.fill = fill; cell.font = Font(color="FFFFFF", bold=True); cell.alignment = Alignment(horizontal="center")
-    summary.freeze_panes = "C2"; summary.column_dimensions["A"].width = 28; summary.column_dimensions["B"].width = 24
-    for col in range(3, 3 + days): summary.column_dimensions[summary.cell(1, col).column_letter].width = 42
-    for row in summary.iter_rows(min_row=2):
-        for cell in row: cell.alignment = Alignment(vertical="top", wrap_text=True)
-    for name, _, url in PROVIDERS:
-        sheet = wb.create_sheet(re.sub(r"[\\/*?:\[\]]", "", name)[:31]); sheet.append(["Power Provider", "Date", "Time", "Location", "Reason", "Status", "Source"])
-        for r in grouped.get(name, []): sheet.append([name, r["event_date"], f"{r['start_time'] or ''} to {r['end_time'] or ''}", r["location"], r["reason"], r["status"], r["source_url"]])
-        for cell in sheet[1]: cell.fill = fill; cell.font = Font(color="FFFFFF", bold=True)
-        sheet.freeze_panes = "A2"; sheet.auto_filter.ref = sheet.dimensions
-        for width, letter in zip((24, 13, 22, 65, 45, 14, 45), "ABCDEFG"): sheet.column_dimensions[letter].width = width
-        for row in sheet.iter_rows():
-            for cell in row: cell.alignment = Alignment(vertical="top", wrap_text=True)
-    output = BytesIO(); wb.save(output); output.seek(0)
-    filename = f"Scheduled_Power_Interruption_{start_date}_{end_date}.xlsx"
-    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+def build_payload() -> dict:
+    html, source_mode = fetch_html()
+    parsed = parse_pagasa(html)
+    weekly = fetch_weekly_outlook()
+    rows = []
+    overrides = load_overrides()
+    for region, site, source_city in SITES:
+        city_data = parsed["cities"].get(source_city.casefold())
+        # Copy shared city forecasts so site-specific red overrides cannot overwrite one another.
+        days = [dict(day) for day in city_data["days"]] if city_data else []
+        for day in days:
+            base_auto = automatic_severity(day["condition"])
+            context = weekly_context(site, day["date"], day["condition"], weekly)
+            auto = context["severity"]
+            red = bool(overrides.get(override_key(site, day["date"])))
+            day.update({
+                "forecast_window": context["forecast_window"],
+                "base_severity": base_auto,
+                "automatic_severity": auto,
+                "severity": "red" if red else auto,
+                "red_override": red,
+                "weather_alert": context["weather_alert"],
+                "alert_level": context["alert_level"],
+                "overlay_source": context["overlay_source"],
+                "severity_basis": "Admin override" if red else (context["overlay_source"] or "PAGASA selected-city outlook"),
+            })
+        rows.append({
+            "region": region,
+            "site": site,
+            "source_city": source_city,
+            "days": days,
+            "available": bool(city_data),
+        })
+    return {
+        "issued": parsed["issued"],
+        "retrieved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source_mode": source_mode,
+        "source_url": PAGASA_URL,
+        "weekly_outlook": weekly,
+        "rows": rows,
+    }
 
 
-app.mount("/", StaticFiles(directory=ROOT / "static", html=True), name="static")
+def forecast_sentence(day: dict) -> str:
+    rain = f"{day['rain_chance']}% chance of rain" if day["rain_chance"] is not None else "Rain chance unavailable"
+    labels = {"green": "GREEN - Light rain/rainfall", "yellow": "YELLOW - Moderate rain/rainfall", "orange": "ORANGE - Heavy rain/rainfall", "red": "RED - Admin override", "none": "No rain classification"}
+    level = labels.get(day.get("severity", "none"), "Unclassified")
+    overlay = f" Regional outlook: {day['weather_alert']}." if day.get("weather_alert") else ""
+    return f"{level}. {day['condition']}. Low {day['low']}, high {day['high']}; {rain}. Forecast window: {day['forecast_window']}.{overlay}"
+
+
+def export_workbook(payload: dict) -> BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "5-Day Forecast"
+    ws.sheet_view.showGridLines = False
+    dates = []
+    for row in payload["rows"]:
+        if row["days"]:
+            dates = [day["date"] for day in row["days"][:5]]
+            break
+    while len(dates) < 5:
+        dates.append(f"Day {len(dates) + 1}")
+
+    ws.append([None, "Site", *dates])
+    for row in payload["rows"]:
+        values = [row["region"], row["site"]]
+        values += [forecast_sentence(d) for d in row["days"][:5]]
+        values += ["Forecast unavailable"] * (7 - len(values))
+        ws.append(values)
+
+    severity_fills = {
+        "green": PatternFill("solid", fgColor="C6EFCE"),
+        "yellow": PatternFill("solid", fgColor="FFF2CC"),
+        "orange": PatternFill("solid", fgColor="F4B183"),
+        "red": PatternFill("solid", fgColor="FF6B6B"),
+        "none": PatternFill("solid", fgColor="F2F2F2"),
+    }
+    severity_fonts = {"green": "006100", "yellow": "7F6000", "orange": "9C0006", "red": "FFFFFF", "none": "595959"}
+    for row_index, row in enumerate(payload["rows"], start=2):
+        for day_index, day in enumerate(row["days"][:5], start=3):
+            # Use the final displayed severity. Admin overrides set this value to red.
+            final_severity = day.get("severity", "none")
+            cell = ws.cell(row_index, day_index)
+            cell.fill = severity_fills.get(final_severity, severity_fills["none"])
+            cell.font = Font(color=severity_fonts.get(final_severity, severity_fonts["none"]), bold=final_severity == "red")
+
+    navy, blue, white = "17365D", "D9EAF7", "FFFFFF"
+    ws["B1"].fill = PatternFill("solid", fgColor=navy)
+    for cell in ws[1][1:7]:
+        cell.fill = PatternFill("solid", fgColor=navy)
+        cell.font = Font(color=white, bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Side(style="thin", color="A6A6A6")
+    for row in ws.iter_rows(min_row=2, max_row=13, min_col=1, max_col=7):
+        for cell in row:
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        row[0].fill = PatternFill("solid", fgColor=navy)
+        row[0].font = Font(color=white, bold=True)
+        row[1].fill = PatternFill("solid", fgColor=blue)
+        row[1].font = Font(bold=True)
+    ws.merge_cells("A2:A8")
+    ws.merge_cells("A9:A10")
+    ws.merge_cells("A11:A13")
+    for cell in (ws["A2"], ws["A9"], ws["A11"]):
+        cell.alignment = Alignment(horizontal="center", vertical="center", text_rotation=90)
+    widths = [13, 18, 38, 38, 38, 38, 38]
+    for i, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    ws.row_dimensions[1].height = 34
+    for i in range(2, 14):
+        ws.row_dimensions[i].height = 84
+    ws.freeze_panes = "C2"
+    ws.auto_filter.ref = "B1:G13"
+
+    meta = wb.create_sheet("Source")
+    meta.append(["Field", "Value"])
+    meta.append(["PAGASA URL", payload["source_url"]])
+    meta.append(["Issued", payload["issued"]])
+    meta.append(["Retrieved", payload["retrieved_at"]])
+    meta.append(["Source mode", payload["source_mode"]])
+    meta.append([])
+    meta.append(["Rainfall intensity", "Meaning"])
+    legend = [
+        ("GREEN", "Light rain/rainfall", "C6EFCE", "006100"),
+        ("YELLOW", "Moderate rain/rainfall", "FFF2CC", "7F6000"),
+        ("ORANGE", "Heavy rain/rainfall, including regional at-times-heavy outlooks", "F4B183", "9C0006"),
+        ("RED", "Admin override; discretionary escalation applied in production", "FF6B6B", "FFFFFF"),
+        ("GRAY", "No rain classification", "F2F2F2", "595959"),
+    ]
+    for level, meaning, fill, font_color in legend:
+        meta.append([level, meaning])
+        for cell in meta[meta.max_row]:
+            cell.fill = PatternFill("solid", fgColor=fill)
+            cell.font = Font(color=font_color, bold=True)
+    meta.column_dimensions["A"].width = 20
+    meta.column_dimensions["B"].width = 95
+    meta["A1"].font = meta["B1"].font = Font(bold=True, color=white)
+    meta["A1"].fill = meta["B1"].fill = PatternFill("solid", fgColor=navy)
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+@app.get("/")
+def home():
+    return FileResponse(STATIC / "index.html")
+
+
+@app.get("/monitor")
+def monitor():
+    return FileResponse(STATIC / "monitor.html")
+
+
+@app.get("/guidance")
+def guidance():
+    return FileResponse(STATIC / "guidance.html")
+
+
+@app.get("/history")
+def history():
+    return FileResponse(STATIC / "history.html")
+
+
+@app.get("/api/forecast")
+def forecast():
+    return JSONResponse(build_payload())
+
+
+@app.get("/api/situation")
+def situation():
+    return JSONResponse(fetch_current_situation())
+
+
+@app.get("/api/history")
+def history_api(site: str = "Metro Manila", month: int = datetime.now().month):
+    return JSONResponse(fetch_historical_summary(site, month))
+
+
+@app.get("/api/admin/status")
+def admin_status(request: Request):
+    return {"authenticated": is_admin(request), "configured": bool(os.getenv("ADMIN_PASSWORD_HASH"))}
+
+
+@app.post("/api/admin/login")
+def admin_login(payload: LoginPayload, response: Response):
+    if not os.getenv("ADMIN_PASSWORD_HASH"):
+        raise HTTPException(503, "Admin access is not configured.")
+    if not verify_password(payload.password):
+        raise HTTPException(401, "Incorrect admin password.")
+    response.set_cookie(
+        "pagasa_admin",
+        session_token(),
+        max_age=8 * 60 * 60,
+        httponly=True,
+        secure=bool(os.getenv("VERCEL")),
+        samesite="strict",
+    )
+    return {"authenticated": True}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(response: Response):
+    response.delete_cookie("pagasa_admin")
+    return {"authenticated": False}
+
+
+@app.put("/api/admin/override")
+def update_override(payload: OverridePayload, request: Request):
+    if not is_admin(request):
+        raise HTTPException(401, "Admin login required.")
+    valid_sites = {site.casefold() for _, site, _ in SITES}
+    if payload.site.casefold() not in valid_sites or not payload.date.strip():
+        raise HTTPException(400, "Invalid site or forecast date.")
+    data = load_overrides(force=True)
+    key = override_key(payload.site, payload.date)
+    if payload.red:
+        data[key] = {"red": True, "updated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+    else:
+        data.pop(key, None)
+    save_overrides(data)
+    return {"site": payload.site, "date": payload.date, "red_override": payload.red}
+
+
+@app.get("/api/export")
+def export():
+    payload = build_payload()
+    stream = export_workbook(payload)
+    filename = f"PAGASA_5-Day_Forecast_{datetime.now():%Y%m%d}.xlsx"
+    return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
