@@ -1,67 +1,34 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>PAGASA Weather Operations Dashboard</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PowerWatch PH</title><link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">TP</span><div><strong>Teleperformance</strong><small>5-Day Weather Forecast</small></div></div>
-      <nav>
-        <a class="nav-link active" href="/">▦ <span>Dashboard</span></a>
-        <a class="nav-link" href="/#forecast">☂ <span>5-Day Forecast</span></a>
-        <a class="nav-link" href="/monitor">◉ <span>Live Storm Map</span></a>
-        <a class="nav-link" href="/guidance">☷ <span>Guidance</span></a>
-        <a class="nav-link" href="/history">◷ <span>Historical</span></a>
-      </nav>
-      <div class="sidebar-foot"><span class="live-dot"></span> PAGASA live sources<br><small>Automatic refresh: 30 minutes</small></div>
-    </aside>
-    <div class="workspace">
-      <header class="topbar">
-        <div><p class="eyebrow">WEATHER OPERATIONS</p><h1>Forecast Dashboard</h1></div>
-        <div class="actions">
-          <button id="theme-toggle" class="icon-button" aria-label="Toggle dark mode">☾</button>
-          <button id="admin-login">Admin</button>
-          <button id="refresh">Refresh</button>
-          <a class="button primary" href="/api/export">Export Excel</a>
-        </div>
-      </header>
-      <main>
-        <section id="overview" class="overview-grid">
-          <article class="summary-card"><span>Data status</span><strong id="status">Connecting…</strong><small id="retrieved"></small></article>
-          <article class="summary-card"><span>Forecast validity</span><strong id="issued">Loading…</strong><small>Official selected-city product</small></article>
-          <article class="summary-card"><span>Next update</span><strong id="next-refresh">30:00</strong><small>Auto-refresh interval</small></article>
-          <article class="summary-card risk"><span>Elevated cells</span><strong id="risk-count">—</strong><small>Moderate, heavy, cyclone or monsoon</small></article>
-        </section>
-
-        <section id="outlook" class="outlook-panel">
-          <div class="section-heading"><div><p class="eyebrow">PAGASA WEEKLY OUTLOOK</p><h2>Weather systems and hazards</h2></div><a id="outlook-source" target="_blank" rel="noopener">Official source ↗</a></div>
-          <div id="outlook-content" class="outlook-content">Loading the weekly weather outlook…</div>
-        </section>
-
-        <section id="forecast" class="forecast-panel">
-          <div class="section-heading"><div><p class="eyebrow">SITE MONITORING</p><h2>5-Day Forecast Matrix</h2></div></div>
-          <div class="legend" aria-label="Rainfall warning legend">
-            <span class="legend-label">Rainfall intensity</span>
-            <span class="legend-item green">Light / rainshowers</span>
-            <span class="legend-item yellow">Moderate</span>
-            <span class="legend-item orange">Heavy / at times heavy</span>
-            <span class="legend-item red">Admin RED override</span>
-          </div>
-          <div class="table-shell"><table><thead><tr id="head"><th>Region</th><th>Site</th></tr></thead><tbody id="forecast-body"></tbody></table></div>
-          <div class="notes">
-            <p><strong>Time window:</strong> The selected-city feed is daily. Where PAGASA’s weekly outlook identifies a time of day, the dashboard shows it (for example, “afternoon to evening”). Exact 2–6 PM probabilities are not published in this source.</p>
-            <p><strong>Two data layers:</strong> “Base” is the mapped selected-city forecast. “Regional overlay” is a separate weekly hazard outlook for the site’s actual administrative region. GenSan uses Metro Davao only as its base proxy, then receives SOCCSKSARGEN-specific hazard information.</p>
-          </div>
-        </section>
-      </main>
-    </div>
-  </div>
-  <dialog id="admin-dialog"><form id="admin-form" method="dialog"><button class="dialog-close" type="button" aria-label="Close">×</button><p class="eyebrow">RESTRICTED CONTROL</p><h2>Admin access</h2><p>Sign in to apply or remove RED overrides.</p><label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password" required><p id="admin-error" class="form-error" role="alert"></p><button class="dialog-submit" type="submit">Sign in</button></form></dialog>
-  <script src="/static/app.js"></script>
-  <script src="/static/chatbot.js?v=1"></script>
+  <header>
+    <div><span class="eyebrow">PHILIPPINES · GRID INTELLIGENCE</span><h1>PowerWatch <b>PH</b></h1><p>Scheduled interruption monitor across 16 electric utilities.</p></div>
+    <div class="actions"><button id="facebook">Connect Facebook</button><button id="refresh">Refresh sources</button><a id="export" class="button primary" href="#">Export Excel</a></div>
+  </header>
+  <main>
+    <section class="metrics">
+      <article><span>Upcoming</span><strong id="upcoming">0</strong><small>in selected window</small></article>
+      <article><span>Cancelled</span><strong id="cancelled">0</strong><small>retained for audit</small></article>
+      <article><span>Providers</span><strong id="providers">16</strong><small>Facebook sources</small></article>
+      <article><span>Data refresh</span><strong id="refreshState">Hourly</strong><small id="lastRun">waiting for first run</small></article>
+    </section>
+    <section class="toolbar">
+      <label>From<input id="start" type="date"></label><label>To<input id="end" type="date"></label>
+      <label>Provider<select id="provider"><option value="">All providers</option></select></label>
+      <label>Status<select id="status"><option value="">All statuses</option><option>Scheduled</option><option>Cancelled</option><option>Rescheduled</option></select></label>
+      <label class="search">Search<input id="search" placeholder="Location, reason, provider…"></label>
+    </section>
+    <section class="tableCard">
+      <div class="sectionHead"><div><span class="eyebrow">INTERRUPTION FEED</span><h2>Verified schedule</h2></div><span id="resultCount">0 records</span></div>
+      <div class="tableWrap"><table><thead><tr><th>Date</th><th>Provider</th><th>Time</th><th>Affected location</th><th>Reason</th><th>Status</th><th>Source</th></tr></thead><tbody id="rows"></tbody></table></div>
+      <div id="empty" class="empty" hidden><strong>No matching records</strong><span>Run a refresh or change the filters.</span></div>
+    </section>
+    <details class="health"><summary>Source health <span id="healthSummary">Not checked</span></summary><div id="healthGrid"></div></details>
+  </main>
+  <div id="toast"></div><script src="app.js"></script>
 </body>
 </html>
