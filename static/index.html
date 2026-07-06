@@ -11,9 +11,10 @@
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark">PW</span><div><strong>PAGASA Weather</strong><small>Operations Tool</small></div></div>
       <nav>
-        <a class="nav-link active" href="#overview">▦ <span>Dashboard</span></a>
-        <a class="nav-link" href="#forecast">☂ <span>5-Day Forecast</span></a>
-        <a class="nav-link" href="#outlook">⚠ <span>Weather Outlook</span></a>
+        <a class="nav-link active" href="/">▦ <span>Dashboard</span></a>
+        <a class="nav-link" href="/#forecast">☂ <span>5-Day Forecast</span></a>
+        <a class="nav-link" href="/monitor">◉ <span>Live Storm Map</span></a>
+        <a class="nav-link" href="/guidance">☷ <span>Guidance</span></a>
       </nav>
       <div class="sidebar-foot"><span class="live-dot"></span> PAGASA live sources<br><small>Automatic refresh: 30 minutes</small></div>
     </aside>
@@ -52,7 +53,7 @@
           <div class="table-shell"><table><thead><tr id="head"><th>Region</th><th>Site</th></tr></thead><tbody id="forecast-body"></tbody></table></div>
           <div class="notes">
             <p><strong>Time window:</strong> The selected-city feed is daily. Where PAGASA’s weekly outlook identifies a time of day, the dashboard shows it (for example, “afternoon to evening”). Exact 2–6 PM probabilities are not published in this source.</p>
-            <p>Sites not individually published by PAGASA use the nearest selected-city outlook; the mapped source is shown per site.</p>
+            <p><strong>Two data layers:</strong> “Base” is the mapped selected-city forecast. “Regional overlay” is a separate weekly hazard outlook for the site’s actual administrative region. GenSan uses Metro Davao only as its base proxy, then receives SOCCSKSARGEN-specific hazard information.</p>
           </div>
         </section>
       </main>

@@ -26,6 +26,8 @@ STATIC = ROOT / "static"
 SNAPSHOT = ROOT / "data" / "pagasa_selected_cities.html"
 PAGASA_URL = "https://www.pagasa.dost.gov.ph/weather/weather-outlook-selected-philippine-cities"
 PAGASA_WEEKLY_URL = "https://www.pagasa.dost.gov.ph/weather/weather-outlook-weekly"
+PAGASA_DAILY_URL = "https://www.pagasa.dost.gov.ph/weather"
+PANAHON_URL = "https://www.panahon.gov.ph/"
 LOCAL_OVERRIDES = ROOT / "data" / "overrides.json"
 OVERRIDE_PREFIX = "pagasa-weather-overrides/"
 FORECAST_WINDOW = "8:00 AM – 8:00 AM next day"
@@ -130,7 +132,47 @@ def weekly_context(site: str, date_text: str, condition: str, weekly: dict) -> d
             alert = "Enhanced Habagat / monsoon rain risk"
             alert_level = "monsoon"
 
-    return {"severity": severity, "forecast_window": timing, "weather_alert": alert, "alert_level": alert_level}
+    return {
+        "severity": severity,
+        "forecast_window": timing,
+        "weather_alert": alert,
+        "alert_level": alert_level,
+        "overlay_source": "PAGASA weekly regional outlook" if alert else "",
+    }
+
+
+def fetch_current_situation() -> dict:
+    try:
+        response = requests.get(PAGASA_DAILY_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0 PAGASA-Weather-Tool/1.0"})
+        response.raise_for_status()
+        html = response.content.decode("utf-8", errors="replace")
+        text = " ".join(BeautifulSoup(html, "html.parser").get_text(" ", strip=True).replace("\xa0", " ").replace("�", "°").split())
+
+        def value(label: str, following: str) -> str:
+            match = re.search(rf"{label}:?\s*(.+?)(?=\s+(?:{following}))", text, re.I)
+            return match.group(1).strip() if match else "Unavailable"
+
+        issued = re.search(r"Issued at:\s*(.+?)(?=\s+Synopsis)", text, re.I)
+        synopsis = value("Synopsis", "TC Information|Forecast Weather Conditions")
+        tc_block = re.search(r"TC Information\s+(.+?)(?=\s+Forecast Weather Conditions)", text, re.I)
+        tc_text = tc_block.group(1).strip() if tc_block else "No tropical cyclone information published in the daily forecast."
+        name_match = re.search(r"((?:SUPER\s+)?TYPHOON|TROPICAL STORM|SEVERE TROPICAL STORM|TROPICAL DEPRESSION)\s+([A-Z0-9() -]+?)(?=\s+LOCATION:)", tc_text, re.I)
+        return {
+            "available": True,
+            "issued": issued.group(1).strip() if issued else "Issue time unavailable",
+            "synopsis": synopsis,
+            "tc_status": re.sub(r"\s+", " ", tc_text),
+            "tc_name": " ".join(name_match.groups()).title() if name_match else "No named cyclone in daily forecast",
+            "location": value("LOCATION", "MAXIMUM SUSTAINED WINDS"),
+            "winds": value("MAXIMUM SUSTAINED WINDS", "GUSTINESS"),
+            "gustiness": value("GUSTINESS", "MOVEMENT"),
+            "movement": value("MOVEMENT", "Forecast Weather Conditions"),
+            "source_url": PAGASA_DAILY_URL,
+            "map_url": PANAHON_URL,
+            "retrieved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+    except requests.RequestException as exc:
+        return {"available": False, "error": str(exc), "source_url": PAGASA_DAILY_URL, "map_url": PANAHON_URL}
 
 
 def override_key(site: str, date: str) -> str:
@@ -274,16 +316,20 @@ def build_payload() -> dict:
         # Copy shared city forecasts so site-specific red overrides cannot overwrite one another.
         days = [dict(day) for day in city_data["days"]] if city_data else []
         for day in days:
+            base_auto = automatic_severity(day["condition"])
             context = weekly_context(site, day["date"], day["condition"], weekly)
             auto = context["severity"]
             red = bool(overrides.get(override_key(site, day["date"])))
             day.update({
                 "forecast_window": context["forecast_window"],
+                "base_severity": base_auto,
                 "automatic_severity": auto,
                 "severity": "red" if red else auto,
                 "red_override": red,
                 "weather_alert": context["weather_alert"],
                 "alert_level": context["alert_level"],
+                "overlay_source": context["overlay_source"],
+                "severity_basis": "Admin override" if red else (context["overlay_source"] or "PAGASA selected-city outlook"),
             })
         rows.append({
             "region": region,
@@ -388,9 +434,24 @@ def home():
     return FileResponse(STATIC / "index.html")
 
 
+@app.get("/monitor")
+def monitor():
+    return FileResponse(STATIC / "monitor.html")
+
+
+@app.get("/guidance")
+def guidance():
+    return FileResponse(STATIC / "guidance.html")
+
+
 @app.get("/api/forecast")
 def forecast():
     return JSONResponse(build_payload())
+
+
+@app.get("/api/situation")
+def situation():
+    return JSONResponse(fetch_current_situation())
 
 
 @app.get("/api/admin/status")
