@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from calendar import monthrange
 from io import BytesIO
 from pathlib import Path
 import hashlib
@@ -47,6 +48,16 @@ SITES = [
     ("", "Davao", "Metro Davao"),
     ("", "GenSan", "Metro Davao"),
 ]
+
+SITE_COORDS = {
+    "Alabang": (14.419, 121.044), "Antipolo": (14.586, 121.176),
+    "Baguio": (16.402, 120.596), "Clark": (15.186, 120.560),
+    "Laoag": (18.198, 120.594), "Metro Manila": (14.599, 120.984),
+    "Molino": (14.396, 120.974), "Bacolod": (10.676, 122.951),
+    "Cebu": (10.315, 123.885), "CDO": (8.454, 124.632),
+    "Davao": (7.190, 125.455), "GenSan": (6.116, 125.171),
+}
+OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 
 app = FastAPI(title="PAGASA 5-Day Weather Tool")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -173,6 +184,91 @@ def fetch_current_situation() -> dict:
         }
     except requests.RequestException as exc:
         return {"available": False, "error": str(exc), "source_url": PAGASA_DAILY_URL, "map_url": PANAHON_URL}
+
+
+def fetch_historical_summary(site: str, month: int) -> dict:
+    if site not in SITE_COORDS:
+        raise HTTPException(400, "Unknown site.")
+    if month < 1 or month > 12:
+        raise HTTPException(400, "Month must be between 1 and 12.")
+
+    now = datetime.now().astimezone()
+    newest_year = now.year if month <= now.month else now.year - 1
+    years = list(range(newest_year - 4, newest_year + 1))
+    start_date = f"{years[0]}-{month:02d}-01"
+    final_day = monthrange(years[-1], month)[1]
+    if years[-1] == now.year and month == now.month:
+        final_day = max(1, min(final_day, now.day - 5))
+    end_date = f"{years[-1]}-{month:02d}-{final_day:02d}"
+    latitude, longitude = SITE_COORDS[site]
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_gusts_10m_max,weather_code",
+        "timezone": "Asia/Manila",
+        "wind_speed_unit": "kmh",
+        "precipitation_unit": "mm",
+    }
+    try:
+        response = requests.get(OPEN_METEO_ARCHIVE, params=params, timeout=35, headers={"User-Agent": "Teleperformance-Weather-History/1.0"})
+        response.raise_for_status()
+        daily = response.json().get("daily", {})
+    except (requests.RequestException, ValueError) as exc:
+        raise HTTPException(503, f"Historical weather source is temporarily unavailable: {exc}")
+
+    records = []
+    keys = ["time", "temperature_2m_max", "temperature_2m_min", "precipitation_sum", "wind_gusts_10m_max", "weather_code"]
+    arrays = [daily.get(key, []) for key in keys]
+    for values in zip(*arrays):
+        date_text, high, low, rain, gust, code = values
+        date = datetime.strptime(date_text, "%Y-%m-%d")
+        if date.month == month and date.year in years:
+            records.append({"date": date_text, "year": date.year, "high": high, "low": low, "rain": rain or 0, "gust": gust or 0, "code": code})
+
+    summaries = []
+    for year in years:
+        items = [item for item in records if item["year"] == year]
+        if not items:
+            summaries.append({"year": year, "available": False})
+            continue
+        rainiest = max(items, key=lambda item: item["rain"])
+        windiest = max(items, key=lambda item: item["gust"])
+        critical = sorted(
+            [item for item in items if item["rain"] >= 50 or item["gust"] >= 62 or item["code"] in (95, 96, 99)],
+            key=lambda item: max(item["rain"] / 50, item["gust"] / 62), reverse=True,
+        )[:6]
+        if rainiest["rain"] >= 100:
+            headline = "Extreme daily rainfall signal in the local reanalysis."
+        elif rainiest["rain"] >= 50:
+            headline = "At least one heavy-rain day in the local reanalysis."
+        elif windiest["gust"] >= 62:
+            headline = "At least one strong-gust day in the local reanalysis."
+        else:
+            headline = "No day crossed the dashboard's heavy-rain or strong-gust screening threshold."
+        summaries.append({
+            "year": year, "available": True, "days": len(items),
+            "partial": year == now.year and month == now.month,
+            "total_rain": round(sum(item["rain"] for item in items), 1),
+            "wet_days": sum(item["rain"] >= 1 for item in items),
+            "heavy_days": sum(item["rain"] >= 50 for item in items),
+            "avg_high": round(sum(item["high"] for item in items) / len(items), 1),
+            "avg_low": round(sum(item["low"] for item in items) / len(items), 1),
+            "max_daily_rain": round(rainiest["rain"], 1), "rainiest_date": rainiest["date"],
+            "max_gust": round(windiest["gust"], 1), "windiest_date": windiest["date"],
+            "critical_days": critical, "headline": headline,
+        })
+    return {
+        "site": site, "month": month, "month_name": datetime(2000, month, 1).strftime("%B"),
+        "years": years, "summaries": summaries, "latitude": latitude, "longitude": longitude,
+        "source": "Open-Meteo Historical Weather API (ERA5 reanalysis)",
+        "source_url": "https://open-meteo.com/en/docs/historical-weather-api",
+        "pagasa_annual_url": "https://www.pagasa.dost.gov.ph/tropical-cyclone/publications/annual-report",
+        "pagasa_preliminary_url": "https://www.pagasa.dost.gov.ph/tropical-cyclone/publications/preliminary-report",
+        "retrieved_at": now.isoformat(timespec="seconds"),
+        "note": "Reanalysis identifies local weather signals, not cyclone causation. Verify named tropical cyclones in PAGASA reports.",
+    }
 
 
 def override_key(site: str, date: str) -> str:
@@ -444,6 +540,11 @@ def guidance():
     return FileResponse(STATIC / "guidance.html")
 
 
+@app.get("/history")
+def history():
+    return FileResponse(STATIC / "history.html")
+
+
 @app.get("/api/forecast")
 def forecast():
     return JSONResponse(build_payload())
@@ -452,6 +553,11 @@ def forecast():
 @app.get("/api/situation")
 def situation():
     return JSONResponse(fetch_current_situation())
+
+
+@app.get("/api/history")
+def history_api(site: str = "Metro Manila", month: int = datetime.now().month):
+    return JSONResponse(fetch_historical_summary(site, month))
 
 
 @app.get("/api/admin/status")
