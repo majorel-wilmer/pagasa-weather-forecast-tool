@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from calendar import monthrange
 from io import BytesIO
 from pathlib import Path
@@ -24,29 +24,37 @@ from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-SNAPSHOT = ROOT / "data" / "pagasa_selected_cities.html"
-PAGASA_URL = "https://www.pagasa.dost.gov.ph/weather/weather-outlook-selected-philippine-cities"
-PAGASA_WEEKLY_URL = "https://www.pagasa.dost.gov.ph/weather/weather-outlook-weekly"
+
+# Tropical-cyclone advisories are not part of Open-Meteo's product, so the storm
+# monitor page still reads PAGASA's official daily bulletin for that one feed.
 PAGASA_DAILY_URL = "https://www.pagasa.dost.gov.ph/weather"
 PANAHON_URL = "https://www.panahon.gov.ph/"
+
+# Everything else (the 5-day matrix, rain timing, historical comparison) is
+# sourced from Open-Meteo: https://open-meteo.com/
+OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+OPEN_METEO_ATTRIBUTION = "https://open-meteo.com/"
+
 LOCAL_OVERRIDES = ROOT / "data" / "overrides.json"
 OVERRIDE_PREFIX = "pagasa-weather-overrides/"
-FORECAST_WINDOW = "8:00 AM – 8:00 AM next day"
 _override_cache = {"loaded_at": 0.0, "data": {}}
 
+# Each site is forecast individually from its own coordinates, so no site has to
+# borrow another city's numbers the way the old PAGASA-table mapping required.
 SITES = [
-    ("LUZON", "Alabang", "Metro Manila"),
-    ("", "Antipolo", "Metro Manila"),
-    ("", "Baguio", "Baguio City"),
-    ("", "Clark", "Sbma (Olongapo)"),
-    ("", "Laoag", "Laoag City"),
-    ("", "Metro Manila", "Metro Manila"),
-    ("", "Molino", "Tagaytay City"),
-    ("VISAYAS", "Bacolod", "Bacolod City"),
-    ("", "Cebu", "Metro Cebu"),
-    ("MINDANAO", "CDO", "Cagayan De Oro City"),
-    ("", "Davao", "Metro Davao"),
-    ("", "GenSan", "Metro Davao"),
+    ("LUZON", "Alabang"),
+    ("", "Antipolo"),
+    ("", "Baguio"),
+    ("", "Clark"),
+    ("", "Laoag"),
+    ("", "Metro Manila"),
+    ("", "Molino"),
+    ("VISAYAS", "Bacolod"),
+    ("", "Cebu"),
+    ("MINDANAO", "CDO"),
+    ("", "Davao"),
+    ("", "GenSan"),
 ]
 
 SITE_COORDS = {
@@ -57,9 +65,25 @@ SITE_COORDS = {
     "Cebu": (10.315, 123.885), "CDO": (8.454, 124.632),
     "Davao": (7.190, 125.455), "GenSan": (6.116, 125.171),
 }
-OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 
-app = FastAPI(title="PAGASA 5-Day Weather Tool")
+# WMO weather codes used by Open-Meteo's "weathercode" field.
+WEATHER_CODE_TEXT = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Depositing rime fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+    56: "Light freezing drizzle", 57: "Dense freezing drizzle",
+    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+    66: "Light freezing rain", 67: "Heavy freezing rain",
+    71: "Slight snow fall", 73: "Moderate snow fall", 75: "Heavy snow fall", 77: "Snow grains",
+    80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    85: "Slight snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail",
+}
+THUNDER_CODES = {95, 96, 99}
+RAIN_HOUR_PROB_THRESHOLD = 40  # % chance used to flag an hour as "rain expected"
+RAIN_HOUR_PRECIP_THRESHOLD = 0.1  # mm in the hour
+
+app = FastAPI(title="Open-Meteo 5-Day Weather Tool")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
@@ -73,91 +97,202 @@ class OverridePayload(BaseModel):
     red: bool
 
 
-def automatic_severity(condition: str) -> str:
-    text = condition.casefold()
-    if any(word in text for word in ("torrential", "heavy", "intense")):
+def weather_code_text(code) -> str:
+    try:
+        return WEATHER_CODE_TEXT.get(int(code), "Forecast unavailable")
+    except (TypeError, ValueError):
+        return "Forecast unavailable"
+
+
+def format_temp(value) -> str:
+    try:
+        return f"{round(float(value))}°C"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def format_clock(dt: datetime) -> str:
+    # Cross-platform 12-hour clock without a leading zero (avoids relying on
+    # the non-portable "%-I" strftime directive).
+    hour12 = dt.hour % 12 or 12
+    return f"{hour12}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
+
+
+def rain_window(hours: list[dict]) -> tuple[str, bool, float]:
+    """Find the most likely contiguous rain period within one calendar day.
+
+    ``hours`` is a list of {"time": datetime, "prob": float|None, "precip": float|None}
+    sorted by time for a single date. Returns (label, has_window, max_hourly_precip_mm).
+    """
+    max_precip = max((h["precip"] or 0 for h in hours), default=0.0)
+    flagged = [
+        h for h in hours
+        if (h["prob"] or 0) >= RAIN_HOUR_PROB_THRESHOLD or (h["precip"] or 0) >= RAIN_HOUR_PRECIP_THRESHOLD
+    ]
+    if not flagged:
+        return "No significant rain expected", False, max_precip
+
+    runs: list[list[dict]] = []
+    current = [flagged[0]]
+    for h in flagged[1:]:
+        if h["time"] - current[-1]["time"] == timedelta(hours=1):
+            current.append(h)
+        else:
+            runs.append(current)
+            current = [h]
+    runs.append(current)
+
+    best = max(runs, key=lambda run: (sum(h["precip"] or 0 for h in run), len(run)))
+    start = best[0]["time"]
+    end = best[-1]["time"] + timedelta(hours=1)
+    label = f"Rain likely {format_clock(start)} \u2013 {format_clock(end)}"
+    return label, True, max_precip
+
+
+def classify_severity(max_hourly_precip_mm: float, rain_chance, day_codes: list[int]) -> str:
+    """Rain-intensity classification using standard hourly-rate thresholds
+    (light < 2.5 mm/hr, moderate 2.5-7.5 mm/hr, heavy > 7.5 mm/hr), with any
+    thunderstorm code forcing at least a heavy rating once rain is measurable."""
+    has_thunder = any(code in THUNDER_CODES for code in day_codes)
+    if max_hourly_precip_mm >= 7.5 or (has_thunder and max_hourly_precip_mm >= 2.5):
         return "orange"
-    if "moderate" in text:
+    if max_hourly_precip_mm >= 2.5:
         return "yellow"
-    if any(word in text for word in ("light rain", "rainfall", "rainshowers", "rain", "thunderstorm")):
+    if max_hourly_precip_mm >= 0.2 or (rain_chance or 0) >= 40 or has_thunder:
         return "green"
     return "none"
 
 
-def fetch_weekly_outlook() -> dict:
-    try:
-        response = requests.get(PAGASA_WEEKLY_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0 PAGASA-Weather-Tool/1.0"})
-        response.raise_for_status()
-        text = " ".join(BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True).replace("\xa0", " ").split())
-        issued = re.search(r"Issued at:\s*(.+?)\s+Valid until:", text, re.I)
-        valid = re.search(r"Valid until:\s*(\d{1,2}:\d{2}\s*[AP]M,\s*\d{1,2}\s+[A-Za-z]+\s+\d{4})", text, re.I)
+def fetch_all_forecasts() -> list[dict]:
+    order = [name for _, name in SITES]
+    lats = ",".join(str(SITE_COORDS[name][0]) for name in order)
+    lons = ",".join(str(SITE_COORDS[name][1]) for name in order)
+    params = {
+        "latitude": lats,
+        "longitude": lons,
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_gusts_10m_max",
+        "hourly": "precipitation_probability,precipitation,weather_code,temperature_2m",
+        "timezone": "Asia/Manila",
+        "forecast_days": 5,
+        "wind_speed_unit": "kmh",
+    }
+    response = requests.get(OPEN_METEO_FORECAST, params=params, timeout=25, headers={"User-Agent": "Open-Meteo-Weather-Tool/2.0"})
+    response.raise_for_status()
+    data = response.json()
+    results = data if isinstance(data, list) else [data]
+    if len(results) != len(order):
+        raise HTTPException(502, "Open-Meteo returned an unexpected number of locations.")
+    return results
+
+
+def build_site_days(payload: dict) -> list[dict]:
+    daily = payload.get("daily", {})
+    hourly = payload.get("hourly", {})
+    hourly_times = hourly.get("time", [])
+    hourly_prob = hourly.get("precipitation_probability", [])
+    hourly_precip = hourly.get("precipitation", [])
+    hourly_code = hourly.get("weather_code", [])
+
+    hours_by_date: dict[str, list[dict]] = {}
+    for i, time_text in enumerate(hourly_times):
+        date_key = time_text[:10]
+        hours_by_date.setdefault(date_key, []).append({
+            "time": datetime.fromisoformat(time_text),
+            "prob": hourly_prob[i] if i < len(hourly_prob) else None,
+            "precip": hourly_precip[i] if i < len(hourly_precip) else None,
+            "code": hourly_code[i] if i < len(hourly_code) else None,
+        })
+
+    days = []
+    dates = daily.get("time", [])
+    for i, date_text in enumerate(dates):
+        label = datetime.strptime(date_text, "%Y-%m-%d").strftime("%A %B %d, %Y")
+        hours = sorted(hours_by_date.get(date_text, []), key=lambda h: h["time"])
+        window_label, has_window, max_precip = rain_window(hours)
+        day_codes = [h["code"] for h in hours if h["code"] is not None]
+        code = daily.get("weather_code", [None] * len(dates))[i]
+        rain_chance = daily.get("precipitation_probability_max", [None] * len(dates))[i]
+        severity = classify_severity(max_precip, rain_chance, day_codes)
+        gust = daily.get("wind_gusts_10m_max", [None] * len(dates))[i]
+
+        alert = ""
+        alert_level = "none"
+        overlay_source = ""
+        if severity == "orange":
+            alert = f"Heavy rain modeled, up to {max_precip:.1f} mm in the peak hour"
+            alert_level = "heavy-rain"
+            overlay_source = "Open-Meteo hourly model"
+        elif any(c in THUNDER_CODES for c in day_codes):
+            alert = "Thunderstorm risk somewhere in the day"
+            alert_level = "thunderstorm"
+            overlay_source = "Open-Meteo hourly model"
+        if gust is not None and gust >= 62:
+            gust_note = f"Strong wind gusts possible, up to {gust:.0f} km/h"
+            alert = f"{alert}; {gust_note}" if alert else gust_note
+            alert_level = "wind" if alert_level == "none" else alert_level
+            overlay_source = overlay_source or "Open-Meteo hourly model"
+
+        days.append({
+            "date": label,
+            "condition": weather_code_text(code),
+            "low": format_temp(daily.get("temperature_2m_min", [None] * len(dates))[i]),
+            "high": format_temp(daily.get("temperature_2m_max", [None] * len(dates))[i]),
+            "rain_chance": int(rain_chance) if rain_chance is not None else None,
+            "rain_mm": round(max_precip, 1),
+            "gust_kmh": round(gust, 1) if gust is not None else None,
+            "icon": None,
+            "forecast_window": window_label,
+            "has_window": has_window,
+            "base_severity": severity,
+            "automatic_severity": severity,
+            "weather_alert": alert,
+            "alert_level": alert_level,
+            "overlay_source": overlay_source,
+        })
+    return days
+
+
+def build_outlook_summary(rows: list[dict]) -> dict:
+    candidates = [
+        (row["site"], day) for row in rows for day in row["days"]
+        if day.get("rain_mm", 0) or day.get("weather_alert")
+    ]
+    if not candidates:
         return {
             "available": True,
-            "issued": issued.group(1) if issued else "Issue time unavailable",
-            "valid_until": valid.group(1) if valid else "",
-            "summary": text,
-            "source_url": PAGASA_WEEKLY_URL,
+            "issued": f"Model run retrieved {datetime.now().astimezone():%Y-%m-%d %H:%M %Z}",
+            "valid_until": "",
+            "summary": "No significant rainfall or wind hazard is currently forecast at any monitored site in the next 5 days.",
+            "source_url": OPEN_METEO_ATTRIBUTION,
         }
-    except requests.RequestException as exc:
-        return {"available": False, "summary": "", "source_url": PAGASA_WEEKLY_URL, "error": str(exc)}
-
-
-def weekly_context(site: str, date_text: str, condition: str, weekly: dict) -> dict:
-    """Merge risks explicitly named in PAGASA's weekly narrative.
-
-    This intentionally does not invent hourly probabilities. The weekly outlook
-    sometimes supplies a qualitative time of day and hazards omitted by the
-    selected-city table.
-    """
-    summary = weekly.get("summary", "").upper()
-    timing = FORECAST_WINDOW
-    alert = ""
-    alert_level = "none"
-    severity = automatic_severity(condition)
-    try:
-        date = datetime.strptime(date_text, "%A %B %d, %Y")
-    except ValueError:
-        date = None
-
-    if "AFTERNOON OR EVENING" in summary and "THUNDERSTORM" in condition.upper():
-        timing = "Afternoon to evening (PAGASA; exact hours unavailable)"
-
-    if date and "BAVI" in summary and date.month == 7 and date.day in (8, 9):
-        if site in {"Laoag", "Baguio"}:
-            alert = "BAVI / INDAY: rains with gusty winds possible"
-            alert_level = "cyclone"
-        if site == "Bacolod" and "NEGROS ISLAND REGION" in summary and "AT TIMES HEAVY RAINS" in summary:
-            severity = "orange"
-            alert = "Enhanced Habagat: light to moderate, at times heavy rain"
-            alert_level = "heavy-rain"
-        if site == "GenSan" and "SOCCSKSARGEN" in summary and "AT TIMES HEAVY RAINS" in summary:
-            severity = "orange"
-            alert = "Enhanced Habagat: light to moderate, at times heavy rain"
-            alert_level = "heavy-rain"
-
-    if date and "BAVI" in summary and date.month == 7 and date.day == 10:
-        if site in {"Laoag", "Baguio"}:
-            alert = "BAVI / INDAY: rains with gusty winds possible"
-            alert_level = "cyclone"
-        elif site in {"Clark", "Molino", "Bacolod", "GenSan"}:
-            alert = "Enhanced Habagat / monsoon rain risk"
-            alert_level = "monsoon"
-
+    ranked = sorted(candidates, key=lambda item: item[1].get("rain_mm", 0), reverse=True)[:5]
+    sentences = []
+    for site, day in ranked:
+        window = day["forecast_window"] if day.get("has_window") else "timing uncertain"
+        detail = f"{site} on {day['date']}: {day['condition']}, {window.replace('Rain likely ', '')}"
+        if day.get("rain_mm"):
+            detail += f", up to {day['rain_mm']:.1f} mm in the peak hour"
+        if day.get("weather_alert"):
+            detail += f" \u2014 {day['weather_alert']}"
+        sentences.append(detail + ".")
     return {
-        "severity": severity,
-        "forecast_window": timing,
-        "weather_alert": alert,
-        "alert_level": alert_level,
-        "overlay_source": "PAGASA weekly regional outlook" if alert else "",
+        "available": True,
+        "issued": f"Model run retrieved {datetime.now().astimezone():%Y-%m-%d %H:%M %Z}",
+        "valid_until": "",
+        "summary": " ".join(sentences),
+        "source_url": OPEN_METEO_ATTRIBUTION,
     }
 
 
 def fetch_current_situation() -> dict:
+    """Tropical-cyclone status is not modeled by Open-Meteo, so this one feed
+    still reads PAGASA's official daily bulletin, which is the authoritative
+    source for named-storm advisories in the Philippines."""
     try:
-        response = requests.get(PAGASA_DAILY_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0 PAGASA-Weather-Tool/1.0"})
+        response = requests.get(PAGASA_DAILY_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0 Weather-Tool/2.0"})
         response.raise_for_status()
         html = response.content.decode("utf-8", errors="replace")
-        text = " ".join(BeautifulSoup(html, "html.parser").get_text(" ", strip=True).replace("\xa0", " ").replace("�", "°").split())
+        text = " ".join(BeautifulSoup(html, "html.parser").get_text(" ", strip=True).replace("\xa0", " ").replace("\ufffd", "\u00b0").split())
 
         def value(label: str, following: str) -> str:
             match = re.search(rf"{label}:?\s*(.+?)(?=\s+(?:{following}))", text, re.I)
@@ -212,7 +347,7 @@ def fetch_historical_summary(site: str, month: int) -> dict:
         "precipitation_unit": "mm",
     }
     try:
-        response = requests.get(OPEN_METEO_ARCHIVE, params=params, timeout=35, headers={"User-Agent": "Teleperformance-Weather-History/1.0"})
+        response = requests.get(OPEN_METEO_ARCHIVE, params=params, timeout=35, headers={"User-Agent": "Open-Meteo-Weather-Tool/2.0"})
         response.raise_for_status()
         daily = response.json().get("daily", {})
     except (requests.RequestException, ValueError) as exc:
@@ -346,99 +481,32 @@ def is_admin(request: Request) -> bool:
         return False
 
 
-def fetch_html() -> tuple[str, str]:
-    try:
-        response = requests.get(PAGASA_URL, timeout=25, headers={"User-Agent": "Mozilla/5.0 PAGASA-Weather-Tool/1.0"})
-        response.raise_for_status()
-        return response.text, "live"
-    except requests.RequestException:
-        if SNAPSHOT.exists():
-            return SNAPSHOT.read_text(encoding="utf-8"), "saved snapshot"
-        raise HTTPException(503, "PAGASA is temporarily unavailable and no saved snapshot exists.")
-
-
-def clean_text(node) -> str:
-    return " ".join(node.get_text(" ", strip=True).replace("\xa0", " ").split())
-
-
-def parse_pagasa(html: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
-    outlook = soup.select_one("#outlook-phil-cities")
-    if not outlook:
-        raise HTTPException(502, "PAGASA page format changed; forecast section was not found.")
-
-    issue = soup.select_one(".validity")
-    issued = clean_text(issue) if issue else "Issue time unavailable"
-    cities = {}
-    for panel in outlook.select(".panel.panel-default"):
-        title = panel.select_one(".panel-title a")
-        table = panel.select_one("table")
-        if not title or not table:
-            continue
-        city = clean_text(title).replace("›", "").strip()
-        headers = [clean_text(th) for th in table.select("thead.desktop-view-thead th")]
-        desktop = table.select_one("tbody tr.desktop-view-tr")
-        if not desktop:
-            continue
-        days = []
-        for header, cell in zip(headers, desktop.select("td")):
-            image = cell.select_one("img")
-            condition = image.get("title", "Forecast unavailable") if image else "Forecast unavailable"
-            low = clean_text(cell.select_one(".min")) if cell.select_one(".min") else "—"
-            high = clean_text(cell.select_one(".max")) if cell.select_one(".max") else "—"
-            rain_node = next((s for s in cell.select("span") if "Chance of rain" in clean_text(s)), None)
-            rain_text = clean_text(rain_node) if rain_node else "Chance of rain: —"
-            rain_match = re.search(r"(\d+)%", rain_text)
-            days.append({
-                "date": header,
-                "condition": condition,
-                "low": low,
-                "high": high,
-                "rain_chance": int(rain_match.group(1)) if rain_match else None,
-                "icon": image.get("src") if image else None,
-            })
-        cities[city.casefold()] = {"name": city, "days": days}
-    return {"issued": issued, "cities": cities}
-
-
 def build_payload() -> dict:
-    html, source_mode = fetch_html()
-    parsed = parse_pagasa(html)
-    weekly = fetch_weekly_outlook()
-    rows = []
+    forecasts = fetch_all_forecasts()
     overrides = load_overrides()
-    for region, site, source_city in SITES:
-        city_data = parsed["cities"].get(source_city.casefold())
-        # Copy shared city forecasts so site-specific red overrides cannot overwrite one another.
-        days = [dict(day) for day in city_data["days"]] if city_data else []
+    rows = []
+    for (region, site), site_payload in zip(SITES, forecasts):
+        days = build_site_days(site_payload)
         for day in days:
-            base_auto = automatic_severity(day["condition"])
-            context = weekly_context(site, day["date"], day["condition"], weekly)
-            auto = context["severity"]
             red = bool(overrides.get(override_key(site, day["date"])))
             day.update({
-                "forecast_window": context["forecast_window"],
-                "base_severity": base_auto,
-                "automatic_severity": auto,
-                "severity": "red" if red else auto,
+                "severity": "red" if red else day["automatic_severity"],
                 "red_override": red,
-                "weather_alert": context["weather_alert"],
-                "alert_level": context["alert_level"],
-                "overlay_source": context["overlay_source"],
-                "severity_basis": "Admin override" if red else (context["overlay_source"] or "PAGASA selected-city outlook"),
+                "severity_basis": "Admin override" if red else (day["overlay_source"] or "Open-Meteo hourly model"),
             })
         rows.append({
             "region": region,
             "site": site,
-            "source_city": source_city,
+            "source_city": site,
             "days": days,
-            "available": bool(city_data),
+            "available": bool(days),
         })
+    weekly = build_outlook_summary(rows)
     return {
-        "issued": parsed["issued"],
+        "issued": f"Open-Meteo model run retrieved {datetime.now().astimezone():%Y-%m-%d %H:%M %Z}",
         "retrieved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "source_mode": source_mode,
-        "source_url": PAGASA_URL,
+        "source_mode": "live",
+        "source_url": OPEN_METEO_ATTRIBUTION,
         "weekly_outlook": weekly,
         "rows": rows,
     }
@@ -448,8 +516,8 @@ def forecast_sentence(day: dict) -> str:
     rain = f"{day['rain_chance']}% chance of rain" if day["rain_chance"] is not None else "Rain chance unavailable"
     labels = {"green": "GREEN - Light rain/rainfall", "yellow": "YELLOW - Moderate rain/rainfall", "orange": "ORANGE - Heavy rain/rainfall", "red": "RED - Admin override", "none": "No rain classification"}
     level = labels.get(day.get("severity", "none"), "Unclassified")
-    overlay = f" Regional outlook: {day['weather_alert']}." if day.get("weather_alert") else ""
-    return f"{level}. {day['condition']}. Low {day['low']}, high {day['high']}; {rain}. Forecast window: {day['forecast_window']}.{overlay}"
+    overlay = f" {day['weather_alert']}." if day.get("weather_alert") else ""
+    return f"{level}. {day['condition']}. Low {day['low']}, high {day['high']}; {rain}. {day['forecast_window']}.{overlay}"
 
 
 def export_workbook(payload: dict) -> BytesIO:
@@ -519,16 +587,16 @@ def export_workbook(payload: dict) -> BytesIO:
 
     meta = wb.create_sheet("Source")
     meta.append(["Field", "Value"])
-    meta.append(["PAGASA URL", payload["source_url"]])
+    meta.append(["Forecast source", "Open-Meteo (open-meteo.com)"])
     meta.append(["Issued", payload["issued"]])
     meta.append(["Retrieved", payload["retrieved_at"]])
     meta.append(["Source mode", payload["source_mode"]])
     meta.append([])
     meta.append(["Rainfall intensity", "Meaning"])
     legend = [
-        ("GREEN", "Light rain/rainfall", "C6EFCE", "006100"),
-        ("YELLOW", "Moderate rain/rainfall", "FFF2CC", "7F6000"),
-        ("ORANGE", "Heavy rain/rainfall, including regional at-times-heavy outlooks", "F4B183", "9C0006"),
+        ("GREEN", "Light rain (<2.5 mm/hr modeled)", "C6EFCE", "006100"),
+        ("YELLOW", "Moderate rain (2.5\u20137.5 mm/hr modeled)", "FFF2CC", "7F6000"),
+        ("ORANGE", "Heavy rain (>7.5 mm/hr modeled) or thunderstorm risk", "F4B183", "9C0006"),
         ("RED", "Admin override; discretionary escalation applied in production", "FF6B6B", "FFFFFF"),
         ("GRAY", "No rain classification", "F2F2F2", "595959"),
     ]
@@ -614,7 +682,7 @@ def admin_logout(response: Response):
 def update_override(payload: OverridePayload, request: Request):
     if not is_admin(request):
         raise HTTPException(401, "Admin login required.")
-    valid_sites = {site.casefold() for _, site, _ in SITES}
+    valid_sites = {site.casefold() for _, site in SITES}
     if payload.site.casefold() not in valid_sites or not payload.date.strip():
         raise HTTPException(400, "Invalid site or forecast date.")
     data = load_overrides(force=True)
@@ -631,5 +699,5 @@ def update_override(payload: OverridePayload, request: Request):
 def export():
     payload = build_payload()
     stream = export_workbook(payload)
-    filename = f"PAGASA_5-Day_Forecast_{datetime.now():%Y%m%d}.xlsx"
+    filename = f"5-Day_Forecast_{datetime.now():%Y%m%d}.xlsx"
     return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
