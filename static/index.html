@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>PAGASA Weather Operations Dashboard</title>
+  <title>Open-Meteo Weather Operations Dashboard</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -17,7 +17,7 @@
         <a class="nav-link" href="/guidance">☷ <span>Guidance</span></a>
         <a class="nav-link" href="/history">◷ <span>Historical</span></a>
       </nav>
-      <div class="sidebar-foot"><span class="live-dot"></span> PAGASA live sources<br><small>Automatic refresh: 30 minutes</small></div>
+      <div class="sidebar-foot"><span class="live-dot"></span> Open-Meteo live model<br><small>Automatic refresh: 30 minutes</small></div>
     </aside>
     <div class="workspace">
       <header class="topbar">
@@ -32,14 +32,14 @@
       <main>
         <section id="overview" class="overview-grid">
           <article class="summary-card"><span>Data status</span><strong id="status">Connecting…</strong><small id="retrieved"></small></article>
-          <article class="summary-card"><span>Forecast validity</span><strong id="issued">Loading…</strong><small>Official selected-city product</small></article>
+          <article class="summary-card"><span>Forecast validity</span><strong id="issued">Loading…</strong><small>Open-Meteo model run</small></article>
           <article class="summary-card"><span>Next update</span><strong id="next-refresh">30:00</strong><small>Auto-refresh interval</small></article>
-          <article class="summary-card risk"><span>Elevated cells</span><strong id="risk-count">—</strong><small>Moderate, heavy, cyclone or monsoon</small></article>
+          <article class="summary-card risk"><span>Elevated cells</span><strong id="risk-count">—</strong><small>Moderate, heavy, thunderstorm or strong gusts</small></article>
         </section>
 
         <section id="outlook" class="outlook-panel">
-          <div class="section-heading"><div><p class="eyebrow">PAGASA WEEKLY OUTLOOK</p><h2>Weather systems and hazards</h2></div><a id="outlook-source" target="_blank" rel="noopener">Official source ↗</a></div>
-          <div id="outlook-content" class="outlook-content">Loading the weekly weather outlook…</div>
+          <div class="section-heading"><div><p class="eyebrow">MODEL OUTLOOK</p><h2>Notable rain and wind signals</h2></div><a id="outlook-source" target="_blank" rel="noopener">Open-Meteo ↗</a></div>
+          <div id="outlook-content" class="outlook-content">Loading the model outlook…</div>
         </section>
 
         <section id="forecast" class="forecast-panel">
@@ -53,8 +53,8 @@
           </div>
           <div class="table-shell"><table><thead><tr id="head"><th>Region</th><th>Site</th></tr></thead><tbody id="forecast-body"></tbody></table></div>
           <div class="notes">
-            <p><strong>Time window:</strong> The selected-city feed is daily. Where PAGASA’s weekly outlook identifies a time of day, the dashboard shows it (for example, “afternoon to evening”). Exact 2–6 PM probabilities are not published in this source.</p>
-            <p><strong>Two data layers:</strong> “Base” is the mapped selected-city forecast. “Regional overlay” is a separate weekly hazard outlook for the site’s actual administrative region. GenSan uses Metro Davao only as its base proxy, then receives SOCCSKSARGEN-specific hazard information.</p>
+            <p><strong>Time window:</strong> Each site's hourly Open-Meteo data is scanned to find the most likely contiguous rain period, shown as an exact clock window (for example, "Rain likely 2:00 PM – 5:00 PM") rather than a vague part of day.</p>
+            <p><strong>Per-site modeling:</strong> Every site is forecast from its own coordinates — no city is used as a stand-in for another. "Model flag" callouts (heavy rain, thunderstorm, strong gusts) come from the same hourly data as the main forecast.</p>
           </div>
         </section>
       </main>
