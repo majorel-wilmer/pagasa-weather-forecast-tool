@@ -517,7 +517,7 @@ def forecast_sentence(day: dict) -> str:
     labels = {"green": "GREEN - Light rain/rainfall", "yellow": "YELLOW - Moderate rain/rainfall", "orange": "ORANGE - Heavy rain/rainfall", "red": "RED - Admin override", "none": "No rain classification"}
     level = labels.get(day.get("severity", "none"), "Unclassified")
     overlay = f" {day['weather_alert']}." if day.get("weather_alert") else ""
-    return f"{level}. {day['condition']}. Low {day['low']}, high {day['high']}; {rain}. {day['forecast_window']}.{overlay}"
+    return f"{level}. {day['condition']}. {rain}. {day['forecast_window']}.{overlay}"
 
 
 def export_workbook(payload: dict) -> BytesIO:
@@ -541,13 +541,13 @@ def export_workbook(payload: dict) -> BytesIO:
         ws.append(values)
 
     severity_fills = {
-        "green": PatternFill("solid", fgColor="C6EFCE"),
-        "yellow": PatternFill("solid", fgColor="FFF2CC"),
-        "orange": PatternFill("solid", fgColor="F4B183"),
-        "red": PatternFill("solid", fgColor="FF6B6B"),
+        "green": PatternFill("solid", fgColor="17AB56"),
+        "yellow": PatternFill("solid", fgColor="E8EB38"),
+        "orange": PatternFill("solid", fgColor="E8B92E"),
+        "red": PatternFill("solid", fgColor="E8001B"),
         "none": PatternFill("solid", fgColor="F2F2F2"),
     }
-    severity_fonts = {"green": "006100", "yellow": "7F6000", "orange": "9C0006", "red": "FFFFFF", "none": "595959"}
+    severity_fonts = {"green": "0B2B16", "yellow": "3A3B08", "orange": "3D2B00", "red": "FFFFFF", "none": "595959"}
     for row_index, row in enumerate(payload["rows"], start=2):
         for day_index, day in enumerate(row["days"][:5], start=3):
             # Use the final displayed severity. Admin overrides set this value to red.
