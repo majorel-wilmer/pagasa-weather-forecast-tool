@@ -118,11 +118,14 @@ def format_clock(dt: datetime) -> str:
     return f"{hour12}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
 
 
-def rain_window(hours: list[dict]) -> tuple[str, bool, float]:
+def rain_window(hours: list[dict]) -> tuple[str, bool, float, dict | None]:
     """Find the most likely contiguous rain period within one calendar day.
 
     ``hours`` is a list of {"time": datetime, "prob": float|None, "precip": float|None}
-    sorted by time for a single date. Returns (label, has_window, max_hourly_precip_mm).
+    sorted by time for a single date. Returns (label, has_window, max_hourly_precip_mm, span).
+    ``span`` (when present) carries the peak window bounds plus the full flagged
+    range, which the narrative writer uses to decide between an explicit clock
+    window and a "throughout the day" phrasing.
     """
     max_precip = max((h["precip"] or 0 for h in hours), default=0.0)
     flagged = [
@@ -130,7 +133,7 @@ def rain_window(hours: list[dict]) -> tuple[str, bool, float]:
         if (h["prob"] or 0) >= RAIN_HOUR_PROB_THRESHOLD or (h["precip"] or 0) >= RAIN_HOUR_PRECIP_THRESHOLD
     ]
     if not flagged:
-        return "No significant rain expected", False, max_precip
+        return "No significant rain expected", False, max_precip, None
 
     runs: list[list[dict]] = []
     current = [flagged[0]]
@@ -146,7 +149,17 @@ def rain_window(hours: list[dict]) -> tuple[str, bool, float]:
     start = best[0]["time"]
     end = best[-1]["time"] + timedelta(hours=1)
     label = f"Rain likely {format_clock(start)} \u2013 {format_clock(end)}"
-    return label, True, max_precip
+
+    total_start = flagged[0]["time"]
+    total_end = flagged[-1]["time"] + timedelta(hours=1)
+    span = {
+        "peak_start": start,
+        "peak_end": end,
+        "total_start": total_start,
+        "total_end": total_end,
+        "total_span_hours": (total_end - total_start).total_seconds() / 3600,
+    }
+    return label, True, max_precip, span
 
 
 def classify_severity(max_hourly_precip_mm: float, rain_chance, day_codes: list[int]) -> str:
@@ -208,7 +221,7 @@ def build_site_days(payload: dict) -> list[dict]:
     for i, date_text in enumerate(dates):
         label = datetime.strptime(date_text, "%Y-%m-%d").strftime("%A %B %d, %Y")
         hours = sorted(hours_by_date.get(date_text, []), key=lambda h: h["time"])
-        window_label, has_window, max_precip = rain_window(hours)
+        window_label, has_window, max_precip, span = rain_window(hours)
         day_codes = [h["code"] for h in hours if h["code"] is not None]
         code = daily.get("weather_code", [None] * len(dates))[i]
         rain_chance = daily.get("precipitation_probability_max", [None] * len(dates))[i]
@@ -243,6 +256,9 @@ def build_site_days(payload: dict) -> list[dict]:
             "icon": None,
             "forecast_window": window_label,
             "has_window": has_window,
+            "peak_start_clock": format_clock(span["peak_start"]) if span else None,
+            "peak_end_clock": format_clock(span["peak_end"]) if span else None,
+            "total_span_hours": round(span["total_span_hours"], 1) if span else None,
             "base_severity": severity,
             "automatic_severity": severity,
             "weather_alert": alert,
@@ -494,6 +510,7 @@ def build_payload() -> dict:
                 "red_override": red,
                 "severity_basis": "Admin override" if red else (day["overlay_source"] or "Open-Meteo hourly model"),
             })
+            day["narrative"] = narrative_sentence(day)
         rows.append({
             "region": region,
             "site": site,
@@ -512,12 +529,88 @@ def build_payload() -> dict:
     }
 
 
-def forecast_sentence(day: dict) -> str:
-    rain = f"{day['rain_chance']}% chance of rain" if day["rain_chance"] is not None else "Rain chance unavailable"
-    labels = {"green": "GREEN - Light rain/rainfall", "yellow": "YELLOW - Moderate rain/rainfall", "orange": "ORANGE - Heavy rain/rainfall", "red": "RED - Admin override", "none": "No rain classification"}
-    level = labels.get(day.get("severity", "none"), "Unclassified")
+def _stable_pick(day: dict, options: int) -> int:
+    """Deterministic pseudo-random pick (0..options-1) seeded by site/date/condition,
+    so the same forecast always renders the same phrasing instead of flickering
+    between refreshes."""
+    seed = f"{day.get('date','')}|{day.get('condition','')}|{day.get('rain_chance','')}"
+    digest = hashlib.md5(seed.encode()).hexdigest()
+    return int(digest, 16) % options
+
+
+def _cloud_phrase(day: dict) -> str:
+    condition = (day.get("condition") or "").lower()
+    if "overcast" in condition:
+        return "Overcast"
+    if "partly cloudy" in condition or "mainly clear" in condition:
+        return "Partly cloudy to cloudy" if _stable_pick(day, 2) == 0 else "Partly cloudy"
+    if "clear" in condition:
+        return "Mostly clear"
+    if "thunderstorm" in condition:
+        return "Stormy"
+    if "drizzle" in condition or "rain" in condition or "showers" in condition:
+        return "Rainy"
+    if "fog" in condition:
+        return "Foggy"
+    return (day.get("condition") or "Variable").rstrip(".")
+
+
+def _timing_phrase(day: dict) -> tuple[str, str | None]:
+    """Return (main_timing_phrase, optional_peak_clause)."""
+    if not day.get("has_window"):
+        return "throughout the day", None
+    start, end = day.get("peak_start_clock"), day.get("peak_end_clock")
+    if not start or not end:
+        return "throughout the day", None
+    span_hours = day.get("total_span_hours")
+
+    def clock(label: str) -> str:
+        return re.sub(r":00 (AM|PM)", r" \1", label)
+
+    explicit = f"from {clock(start)} to {clock(end)}"
+    if span_hours is not None and span_hours >= 20:
+        return "throughout the day", explicit
+    return explicit, None
+
+
+def _rain_qualifier(rain_chance, tier: str) -> str:
+    value = rain_chance if rain_chance is not None else 0
+    if tier == "green":
+        if value >= 60:
+            return "high"
+        if value >= 40:
+            return "medium"
+        return "low"
+    if tier == "yellow":
+        return "significant" if value >= 65 else "moderate"
+    return "high"
+
+
+def narrative_sentence(day: dict) -> str:
+    """Natural-language forecast sentence used in both the web cell and the
+    Excel export, e.g. 'Partly cloudy skies with a high chance of light rain
+    from 7 AM to 11 PM.'"""
+    severity = day.get("severity", "none")
+    timing, peak_clause = _timing_phrase(day)
+    cloud = _cloud_phrase(day)
     overlay = f" {day['weather_alert']}." if day.get("weather_alert") else ""
-    return f"{level}. {day['condition']}. {rain}. {day['forecast_window']}.{overlay}"
+
+    if severity in ("orange", "red"):
+        sentence = f"Expect a high chance of consistent moderate to heavy rain {timing}."
+    elif severity == "yellow":
+        if _stable_pick(day, 2) == 0:
+            qualifier = _rain_qualifier(day.get("rain_chance"), "yellow")
+            sentence = f"Widespread cloudiness is forecasted, along with a {qualifier} chance of light to moderate rain {timing}."
+        else:
+            sentence = f"{cloud} skies with a strong likelihood of light to moderate rainfall {timing}."
+        if peak_clause:
+            sentence = sentence[:-1] + f", particularly {peak_clause}."
+    elif severity == "green":
+        qualifier = _rain_qualifier(day.get("rain_chance"), "green")
+        sentence = f"{cloud} skies with a {qualifier} chance of light rain {timing}."
+    else:
+        sentence = f"{cloud} skies with a low chance of rain."
+    return f"{sentence}{overlay}"
 
 
 def export_workbook(payload: dict) -> BytesIO:
@@ -536,7 +629,7 @@ def export_workbook(payload: dict) -> BytesIO:
     ws.append([None, "Site", *dates])
     for row in payload["rows"]:
         values = [row["region"], row["site"]]
-        values += [forecast_sentence(d) for d in row["days"][:5]]
+        values += [narrative_sentence(d) for d in row["days"][:5]]
         values += ["Forecast unavailable"] * (7 - len(values))
         ws.append(values)
 
