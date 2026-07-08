@@ -629,7 +629,7 @@ def export_workbook(payload: dict) -> BytesIO:
     ws.append([None, "Site", *dates])
     for row in payload["rows"]:
         values = [row["region"], row["site"]]
-        values += [narrative_sentence(d) for d in row["days"][:5]]
+        values += [f"{narrative_sentence(d)}\n{d.get('forecast_window','')}" for d in row["days"][:5]]
         values += ["Forecast unavailable"] * (7 - len(values))
         ws.append(values)
 
