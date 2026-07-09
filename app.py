@@ -675,13 +675,13 @@ def export_workbook(payload: dict) -> BytesIO:
         ws.append(values)
 
     severity_fills = {
-        "green": PatternFill("solid", fgColor="1E8449"),
-        "yellow": PatternFill("solid", fgColor="E8C400"),
-        "orange": PatternFill("solid", fgColor="D35400"),
-        "red": PatternFill("solid", fgColor="C0392B"),
+        "green": PatternFill("solid", fgColor="00B050"),
+        "yellow": PatternFill("solid", fgColor="FFFF00"),
+        "orange": PatternFill("solid", fgColor="FFC000"),
+        "red": PatternFill("solid", fgColor="FF0000"),
         "none": PatternFill("solid", fgColor="BFBFBF"),
     }
-    severity_fonts = {"green": "FFFFFF", "yellow": "3D2E00", "orange": "FFFFFF", "red": "FFFFFF", "none": "404040"}
+    severity_fonts = {"green": "FFFFFF", "yellow": "3D2E00", "orange": "3D2E00", "red": "FFFFFF", "none": "404040"}
     for row_index, row in enumerate(payload["rows"], start=2):
         for day_index, day in enumerate(row["days"][:5], start=3):
             # Use the final displayed severity. Admin overrides set this value to red.
@@ -728,10 +728,10 @@ def export_workbook(payload: dict) -> BytesIO:
     meta.append([])
     meta.append(["Rainfall intensity", "Meaning"])
     legend = [
-        ("GREEN", "Light rain (<2.5 mm/hr modeled)", "1E8449", "FFFFFF"),
-        ("YELLOW", "Moderate rain (2.5\u20137.5 mm/hr modeled)", "E8C400", "3D2E00"),
-        ("ORANGE", "Heavy rain (>7.5 mm/hr modeled) or thunderstorm risk", "D35400", "FFFFFF"),
-        ("RED", "Admin override; discretionary escalation applied in production", "C0392B", "FFFFFF"),
+        ("GREEN", "Light rain (<2.5 mm/hr modeled)", "00B050", "FFFFFF"),
+        ("YELLOW", "Moderate rain (2.5\u20137.5 mm/hr modeled)", "FFFF00", "3D2E00"),
+        ("ORANGE", "Heavy rain (>7.5 mm/hr modeled) or thunderstorm risk", "FFC000", "3D2E00"),
+        ("RED", "Admin override; discretionary escalation applied in production", "FF0000", "FFFFFF"),
         ("GRAY", "No rain classification", "BFBFBF", "404040"),
     ]
     for level, meaning, fill, font_color in legend:
