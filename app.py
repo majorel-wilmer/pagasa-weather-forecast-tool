@@ -776,6 +776,11 @@ def history():
     return FileResponse(STATIC / "history.html")
 
 
+@app.get("/help")
+def help_page():
+    return FileResponse(STATIC / "help.html")
+
+
 @app.get("/api/forecast")
 def forecast():
     return JSONResponse(build_payload())

@@ -1,0 +1,85 @@
+<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Help · Open-Meteo Weather</title><link rel="stylesheet" href="/static/styles.css"></head><body>
+<div class="app-shell"><aside class="sidebar"><div class="brand"><span class="brand-mark">TP</span><div><strong>Teleperformance</strong><small>5-Day Weather Forecast</small></div></div><nav><a class="nav-link" href="/">▦ <span>Dashboard</span></a><a class="nav-link" href="/#forecast">☂ <span>5-Day Forecast</span></a><a class="nav-link" href="/monitor">◉ <span>Live Storm Map</span></a><a class="nav-link" href="/guidance">☷ <span>Guidance</span></a><a class="nav-link" href="/history">◷ <span>Historical</span></a><a class="nav-link active" href="/help">❔ <span>Help</span></a></nav><div class="sidebar-foot"><span class="live-dot"></span> Open-Meteo live model<br><small>Automatic refresh: 30 minutes</small></div></aside>
+<div class="workspace"><header class="topbar"><div><p class="eyebrow">GETTING STARTED</p><h1>Help &amp; Navigation</h1></div></header>
+<main>
+
+<section class="page-panel">
+<h2>What this tool is</h2>
+<p class="notes">This is a decision-support dashboard for WFM/Ops, showing a 5-day rain outlook for each monitored site. Forecast data, rain timing, and intensity are computed from <a href="https://open-meteo.com/" target="_blank">Open-Meteo</a>'s hourly model. Tropical cyclone/typhoon tracking on the Live Storm Map still comes from PAGASA's official bulletin, since Open-Meteo doesn't publish cyclone advisories.</p>
+</section>
+
+<section class="page-panel">
+<h2>Tab-by-tab guide</h2>
+<div class="situation-grid">
+  <article class="data-card">
+    <span>▦ Dashboard</span>
+    <strong>5-Day Forecast</strong>
+    <p>The main table: one row per site, one column per day. Each cell shows the rain narrative (e.g. "Partly cloudy skies with a high chance of light rain from 7 AM to 11 PM"), the rain-chance pill, and a colored top border for severity. The panel above the table also shows a Model Outlook summarizing the most notable rain/wind signals across all sites for the next 5 days.</p>
+  </article>
+  <article class="data-card">
+    <span>◉ Live Storm Map</span>
+    <strong>Storm Monitor</strong>
+    <p>Shows PAGASA's official daily bulletin and any active tropical cyclone information, plus a live map from PANaHON. Use this tab specifically for named-storm tracking — the 5-Day Forecast tab does not cover cyclone advisories.</p>
+  </article>
+  <article class="data-card">
+    <span>☷ Guidance</span>
+    <strong>Detailed Guidance</strong>
+    <p>An expandable, per-site breakdown of each day's forecast with recommended actions (e.g. "check flood-prone routes," "monitor gust forecasts"). Useful when you need more operational detail than the compact dashboard cells show.</p>
+  </article>
+  <article class="data-card">
+    <span>◷ Historical</span>
+    <strong>Historical Weather</strong>
+    <p>Compares the current month against the same month in the past 5 years for a chosen site, using Open-Meteo's historical reanalysis. Useful for spotting whether a season is running wetter or drier than usual.</p>
+  </article>
+</div>
+</section>
+
+<section class="page-panel">
+<h2>Reading a forecast cell</h2>
+<ul class="source-list">
+  <li><strong>Narrative sentence</strong> — plain-language description of sky condition, chance of rain, intensity, and the specific rain window (e.g. "from 2 PM to 5 PM") when the model can pin down a window; otherwise "throughout the day."</li>
+  <li><strong>Rain % pill</strong> — the daily peak chance of measurable rain.</li>
+  <li><strong>Top border color</strong> — the severity tier for that day (see legend below the forecast table on the Dashboard tab).</li>
+  <li><strong>Base badge</strong> — the model-computed severity before any admin override is applied.</li>
+  <li><strong>"Display: X" badge</strong> — only appears when an admin override changes what's shown; it tells you the displayed severity differs from the model's own calculation.</li>
+  <li><strong>Regional hazard overlay box</strong> — appears when the model flags heavy rain, thunderstorm risk, or strong wind gusts for that day.</li>
+</ul>
+</section>
+
+<section class="page-panel">
+<h2>Severity color coding</h2>
+<ul class="source-list">
+  <li><strong>GREEN</strong> — Light rain (&lt;2.5 mm/hr modeled)</li>
+  <li><strong>YELLOW</strong> — Moderate rain (2.5–7.5 mm/hr modeled)</li>
+  <li><strong>ORANGE</strong> — Heavy rain (&gt;7.5 mm/hr modeled) or thunderstorm risk</li>
+  <li><strong>RED</strong> — Admin override; discretionary escalation applied by an operations lead</li>
+  <li><strong>GRAY</strong> — No rain classification (dry/clear day)</li>
+</ul>
+</section>
+
+<section class="page-panel">
+<h2>How to use Admin mode</h2>
+<ol class="source-list">
+  <li>Click the <strong>Admin</strong> button in the top-right of the Dashboard tab.</li>
+  <li>Enter the admin password and click <strong>Sign in</strong>. (This password is set by whoever deployed the tool — ask your team lead if you don't have it.)</li>
+  <li>Once signed in, every forecast cell shows three small buttons in its top-right corner: <strong>Set YELLOW</strong>, <strong>Set ORANGE</strong>, and <strong>Set RED</strong>.</li>
+  <li>Click one to escalate that specific day's displayed severity, regardless of what the model itself calculated — useful when your team has other information (e.g. a local advisory) that the model hasn't caught yet.</li>
+  <li>Only one override level can be active per cell at a time; clicking a different level replaces the previous one.</li>
+  <li>Click the same button again (it will say <strong>Clear</strong>) to remove the override and go back to the model's own severity.</li>
+  <li>Click <strong>Admin</strong> again to sign out. Your session stays active for 8 hours or until you sign out.</li>
+</ol>
+<p class="notes">Overrides only change the <em>displayed</em> severity and color — they don't change the underlying Open-Meteo forecast data, and they're visible to everyone viewing the dashboard.</p>
+</section>
+
+<section class="page-panel">
+<h2>Other things you can do</h2>
+<ul class="source-list">
+  <li><strong>Export Excel</strong> — downloads the same 5-day table as a formatted spreadsheet, with the same severity colors and narrative sentences, plus a Source tab explaining the color legend.</li>
+  <li><strong>Refresh</strong> — manually pulls the latest model run instead of waiting for the automatic 30-minute refresh.</li>
+  <li><strong>Dark mode toggle (☾)</strong> — switches the dashboard's color theme.</li>
+  <li><strong>Chat assistant</strong> — the chat bubble in the bottom-right corner of the Dashboard tab can answer quick questions like "will it rain in Baguio on Thursday?" using the same forecast data.</li>
+</ul>
+</section>
+
+</main></div></div>
+</body></html>
