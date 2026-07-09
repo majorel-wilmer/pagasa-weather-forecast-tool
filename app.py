@@ -360,7 +360,7 @@ def build_site_days(payload: dict) -> list[dict]:
             alert_level = "thunderstorm"
             overlay_source = "Open-Meteo hourly model"
         if gust is not None and gust >= 62:
-            gust_note = f"Strong wind gusts possible, up to {gust:.0f} km/h"
+            gust_note = "Strong wind gusts possible"
             alert = f"{alert}; {gust_note}" if alert else gust_note
             alert_level = "wind" if alert_level == "none" else alert_level
             overlay_source = overlay_source or "Open-Meteo hourly model"
