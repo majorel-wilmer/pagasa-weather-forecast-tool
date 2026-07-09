@@ -626,10 +626,11 @@ def build_payload() -> dict:
             override_entry = overrides.get(override_key(site, day["date"])) or {}
             level = override_entry.get("level")
             day.update({
-                "severity": level if level in ("orange", "red") else day["automatic_severity"],
+                "severity": level if level in ("yellow", "orange", "red") else day["automatic_severity"],
                 "red_override": level == "red",
                 "orange_override": level == "orange",
-                "severity_basis": "Admin override" if level in ("orange", "red") else (day["overlay_source"] or "Open-Meteo hourly model"),
+                "yellow_override": level == "yellow",
+                "severity_basis": "Admin override" if level in ("yellow", "orange", "red") else (day["overlay_source"] or "Open-Meteo hourly model"),
             })
         rows.append({
             "region": region,
@@ -655,7 +656,7 @@ def forecast_sentence(day: dict) -> str:
     fill (green/yellow/orange/red) carries the risk level, so the text itself
     stays natural and readable rather than repeating a GREEN/YELLOW/ORANGE tag."""
     sentence = day.get("narrative") or f"{day['condition']}."
-    if day.get("red_override") or day.get("orange_override"):
+    if day.get("red_override") or day.get("orange_override") or day.get("yellow_override"):
         sentence += " Admin-flagged: treat as elevated risk regardless of the modeled rain chance."
     return sentence
 
@@ -826,8 +827,8 @@ def update_override(payload: OverridePayload, request: Request):
     level = payload.level.strip().lower()
     if payload.site.casefold() not in valid_sites or not payload.date.strip():
         raise HTTPException(400, "Invalid site or forecast date.")
-    if level not in ("none", "orange", "red"):
-        raise HTTPException(400, "Level must be 'none', 'orange', or 'red'.")
+    if level not in ("none", "yellow", "orange", "red"):
+        raise HTTPException(400, "Level must be 'none', 'yellow', 'orange', or 'red'.")
     data = load_overrides(force=True)
     key = override_key(payload.site, payload.date)
     if level == "none":
