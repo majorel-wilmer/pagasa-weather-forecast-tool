@@ -83,6 +83,32 @@ THUNDER_CODES = {95, 96, 99}
 RAIN_HOUR_PROB_THRESHOLD = 40  # % chance used to flag an hour as "rain expected"
 RAIN_HOUR_PRECIP_THRESHOLD = 0.1  # mm in the hour
 
+# Narrative-sentence thresholds (used for the human-readable Excel cells).
+BROAD_PROB_THRESHOLD = 30     # % chance used to flag an hour as "some rain risk"
+BROAD_PRECIP_THRESHOLD = 0.05  # mm in the hour
+HEAVY_HOUR_PRECIP = 2.5        # mm/hr that counts as a standout "peak" hour
+FULL_DAY_HOURS = 21           # flagged hours at/above this = "throughout the day"
+
+# General sky-condition phrasing per WMO weather code (used as the lead-in for
+# the plain-language forecast sentence, e.g. "Partly cloudy skies with a high
+# chance of light rain from 7 AM to 11 PM.").
+SKY_PHRASES = {
+    0: "Clear", 1: "Clear to partly cloudy", 2: "Partly cloudy", 3: "Overcast",
+    45: "Foggy", 48: "Foggy",
+    51: "Partly cloudy", 53: "Partly cloudy", 55: "Cloudy",
+    56: "Partly cloudy", 57: "Cloudy",
+    61: "Partly cloudy", 63: "Cloudy", 65: "Widespread cloudy",
+    66: "Cloudy", 67: "Widespread cloudy",
+    71: "Overcast", 73: "Overcast", 75: "Overcast", 77: "Overcast",
+    80: "Partly cloudy", 81: "Cloudy", 82: "Widespread cloudy",
+    85: "Overcast", 86: "Overcast",
+    95: "Overcast", 96: "Overcast", 99: "Overcast",
+}
+CHANCE_PHRASES = {
+    "low": "a low chance", "medium": "a medium chance",
+    "medium_high": "a medium to high chance", "high": "a high chance",
+}
+
 app = FastAPI(title="Open-Meteo 5-Day Weather Tool")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -118,14 +144,116 @@ def format_clock(dt: datetime) -> str:
     return f"{hour12}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
 
 
-def rain_window(hours: list[dict]) -> tuple[str, bool, float, dict | None]:
+def hour_label(dt: datetime) -> str:
+    """Plain-language hour label without minutes, e.g. '7 AM', '2 PM'."""
+    hour12 = dt.hour % 12 or 12
+    return f"{hour12} {'AM' if dt.hour < 12 else 'PM'}"
+
+
+def chance_bucket(rain_chance) -> str:
+    if rain_chance is None:
+        return "none"
+    if rain_chance < 15:
+        return "none"
+    if rain_chance < 40:
+        return "low"
+    if rain_chance < 60:
+        return "medium"
+    if rain_chance < 80:
+        return "medium_high"
+    return "high"
+
+
+INTENSITY_BY_SEVERITY = {
+    "green": "light",
+    "yellow": "light to moderate",
+    "orange": "moderate to heavy",
+    "red": "heavy to intense",
+}
+
+
+def analyze_rain_day(hours: list[dict]) -> dict:
+    """Characterize a day's hourly rain data for the plain-language sentence:
+    whether rain covers most of the day, the main contiguous rain block, and
+    whether a shorter, heavier peak stands out within that block."""
+    broad = [
+        h for h in hours
+        if (h["prob"] or 0) >= BROAD_PROB_THRESHOLD or (h["precip"] or 0) >= BROAD_PRECIP_THRESHOLD
+    ]
+    if not broad:
+        return {"has_rain": False}
+
+    runs: list[list[dict]] = []
+    current = [broad[0]]
+    for h in broad[1:]:
+        if h["time"] - current[-1]["time"] == timedelta(hours=1):
+            current.append(h)
+        else:
+            runs.append(current)
+            current = [h]
+    runs.append(current)
+
+    main_run = max(runs, key=lambda run: (sum(h["precip"] or 0 for h in run), len(run)))
+    main_start = main_run[0]["time"]
+    main_end = main_run[-1]["time"] + timedelta(hours=1)
+    coverage_hours = sum(len(run) for run in runs)
+    avg_precip = sum(h["precip"] or 0 for h in broad) / len(broad)
+
+    heavy_hours = [h for h in main_run if (h["precip"] or 0) >= HEAVY_HOUR_PRECIP]
+    has_peak = 0 < len(heavy_hours) < len(main_run)
+    peak_start = heavy_hours[0]["time"] if has_peak else None
+    peak_end = heavy_hours[-1]["time"] + timedelta(hours=1) if has_peak else None
+
+    return {
+        "has_rain": True,
+        "main_start": main_start,
+        "main_end": main_end,
+        "coverage_full_day": coverage_hours >= FULL_DAY_HOURS,
+        "avg_precip": avg_precip,
+        "has_peak": has_peak,
+        "peak_start": peak_start,
+        "peak_end": peak_end,
+    }
+
+
+def build_narrative(sky_phrase: str, rain_chance, severity: str, analysis: dict) -> str:
+    if not analysis.get("has_rain") or severity in (None, "none"):
+        return f"{sky_phrase} skies throughout the day."
+
+    intensity = INTENSITY_BY_SEVERITY.get(severity, "light")
+
+    bucket = chance_bucket(rain_chance)
+    if bucket == "none":
+        bucket = "medium"  # rain is measurably happening; avoid contradicting that with "no chance"
+    chance_phrase = CHANCE_PHRASES[bucket]
+
+    coverage_full_day = analysis["coverage_full_day"]
+    has_peak = analysis["has_peak"]
+
+    if coverage_full_day and intensity == "moderate to heavy" and not has_peak:
+        return f"Expect {chance_phrase} of consistent {intensity} rain throughout the day."
+
+    if coverage_full_day:
+        timing_clause = " throughout the day"
+        if has_peak:
+            timing_clause += f", particularly from {hour_label(analysis['peak_start'])} to {hour_label(analysis['peak_end'])}"
+    else:
+        main_start, main_end = analysis["main_start"], analysis["main_end"]
+        if main_end.date() > main_start.date():
+            timing_clause = f" from {hour_label(main_start)} until end of day"
+        elif main_start.hour == 0:
+            timing_clause = f" until {hour_label(main_end)}"
+        else:
+            timing_clause = f" from {hour_label(main_start)} to {hour_label(main_end)}"
+
+    return f"{sky_phrase} skies with {chance_phrase} of {intensity} rain{timing_clause}."
+
+
+def rain_window(hours: list[dict]) -> tuple[str, bool, float]:
     """Find the most likely contiguous rain period within one calendar day.
 
     ``hours`` is a list of {"time": datetime, "prob": float|None, "precip": float|None}
-    sorted by time for a single date. Returns (label, has_window, max_hourly_precip_mm, span).
-    ``span`` (when present) carries the peak window bounds plus the full flagged
-    range, which the narrative writer uses to decide between an explicit clock
-    window and a "throughout the day" phrasing.
+    sorted by time for a single date. Returns (label, has_window, max_hourly_precip_mm).
     """
     max_precip = max((h["precip"] or 0 for h in hours), default=0.0)
     flagged = [
@@ -133,7 +261,7 @@ def rain_window(hours: list[dict]) -> tuple[str, bool, float, dict | None]:
         if (h["prob"] or 0) >= RAIN_HOUR_PROB_THRESHOLD or (h["precip"] or 0) >= RAIN_HOUR_PRECIP_THRESHOLD
     ]
     if not flagged:
-        return "No significant rain expected", False, max_precip, None
+        return "No significant rain expected", False, max_precip
 
     runs: list[list[dict]] = []
     current = [flagged[0]]
@@ -149,17 +277,7 @@ def rain_window(hours: list[dict]) -> tuple[str, bool, float, dict | None]:
     start = best[0]["time"]
     end = best[-1]["time"] + timedelta(hours=1)
     label = f"Rain likely {format_clock(start)} \u2013 {format_clock(end)}"
-
-    total_start = flagged[0]["time"]
-    total_end = flagged[-1]["time"] + timedelta(hours=1)
-    span = {
-        "peak_start": start,
-        "peak_end": end,
-        "total_start": total_start,
-        "total_end": total_end,
-        "total_span_hours": (total_end - total_start).total_seconds() / 3600,
-    }
-    return label, True, max_precip, span
+    return label, True, max_precip
 
 
 def classify_severity(max_hourly_precip_mm: float, rain_chance, day_codes: list[int]) -> str:
@@ -221,18 +339,20 @@ def build_site_days(payload: dict) -> list[dict]:
     for i, date_text in enumerate(dates):
         label = datetime.strptime(date_text, "%Y-%m-%d").strftime("%A %B %d, %Y")
         hours = sorted(hours_by_date.get(date_text, []), key=lambda h: h["time"])
-        window_label, has_window, max_precip, span = rain_window(hours)
+        window_label, has_window, max_precip = rain_window(hours)
         day_codes = [h["code"] for h in hours if h["code"] is not None]
         code = daily.get("weather_code", [None] * len(dates))[i]
         rain_chance = daily.get("precipitation_probability_max", [None] * len(dates))[i]
         severity = classify_severity(max_precip, rain_chance, day_codes)
         gust = daily.get("wind_gusts_10m_max", [None] * len(dates))[i]
+        sky_phrase = SKY_PHRASES.get(code, "Partly cloudy") if code is not None else "Partly cloudy"
+        narrative = build_narrative(sky_phrase, rain_chance, severity, analyze_rain_day(hours))
 
         alert = ""
         alert_level = "none"
         overlay_source = ""
         if severity == "orange":
-            alert = f"Heavy rain modeled, up to {max_precip:.1f} mm in the peak hour"
+            alert = "Heavy rain modeled at its peak hour"
             alert_level = "heavy-rain"
             overlay_source = "Open-Meteo hourly model"
         elif any(c in THUNDER_CODES for c in day_codes):
@@ -256,9 +376,7 @@ def build_site_days(payload: dict) -> list[dict]:
             "icon": None,
             "forecast_window": window_label,
             "has_window": has_window,
-            "peak_start_clock": format_clock(span["peak_start"]) if span else None,
-            "peak_end_clock": format_clock(span["peak_end"]) if span else None,
-            "total_span_hours": round(span["total_span_hours"], 1) if span else None,
+            "narrative": narrative,
             "base_severity": severity,
             "automatic_severity": severity,
             "weather_alert": alert,
@@ -284,13 +402,10 @@ def build_outlook_summary(rows: list[dict]) -> dict:
     ranked = sorted(candidates, key=lambda item: item[1].get("rain_mm", 0), reverse=True)[:5]
     sentences = []
     for site, day in ranked:
-        window = day["forecast_window"] if day.get("has_window") else "timing uncertain"
-        detail = f"{site} on {day['date']}: {day['condition']}, {window.replace('Rain likely ', '')}"
-        if day.get("rain_mm"):
-            detail += f", up to {day['rain_mm']:.1f} mm in the peak hour"
+        detail = f"{site} on {day['date']}: {day['narrative']}"
         if day.get("weather_alert"):
-            detail += f" \u2014 {day['weather_alert']}"
-        sentences.append(detail + ".")
+            detail += f" \u2014 {day['weather_alert']}."
+        sentences.append(detail)
     return {
         "available": True,
         "issued": f"Model run retrieved {datetime.now().astimezone():%Y-%m-%d %H:%M %Z}",
@@ -510,7 +625,6 @@ def build_payload() -> dict:
                 "red_override": red,
                 "severity_basis": "Admin override" if red else (day["overlay_source"] or "Open-Meteo hourly model"),
             })
-            day["narrative"] = narrative_sentence(day)
         rows.append({
             "region": region,
             "site": site,
@@ -529,88 +643,15 @@ def build_payload() -> dict:
     }
 
 
-def _stable_pick(day: dict, options: int) -> int:
-    """Deterministic pseudo-random pick (0..options-1) seeded by site/date/condition,
-    so the same forecast always renders the same phrasing instead of flickering
-    between refreshes."""
-    seed = f"{day.get('date','')}|{day.get('condition','')}|{day.get('rain_chance','')}"
-    digest = hashlib.md5(seed.encode()).hexdigest()
-    return int(digest, 16) % options
-
-
-def _cloud_phrase(day: dict) -> str:
-    condition = (day.get("condition") or "").lower()
-    if "overcast" in condition:
-        return "Overcast"
-    if "partly cloudy" in condition or "mainly clear" in condition:
-        return "Partly cloudy to cloudy" if _stable_pick(day, 2) == 0 else "Partly cloudy"
-    if "clear" in condition:
-        return "Mostly clear"
-    if "thunderstorm" in condition:
-        return "Stormy"
-    if "drizzle" in condition or "rain" in condition or "showers" in condition:
-        return "Rainy"
-    if "fog" in condition:
-        return "Foggy"
-    return (day.get("condition") or "Variable").rstrip(".")
-
-
-def _timing_phrase(day: dict) -> tuple[str, str | None]:
-    """Return (main_timing_phrase, optional_peak_clause)."""
-    if not day.get("has_window"):
-        return "throughout the day", None
-    start, end = day.get("peak_start_clock"), day.get("peak_end_clock")
-    if not start or not end:
-        return "throughout the day", None
-    span_hours = day.get("total_span_hours")
-
-    def clock(label: str) -> str:
-        return re.sub(r":00 (AM|PM)", r" \1", label)
-
-    explicit = f"from {clock(start)} to {clock(end)}"
-    if span_hours is not None and span_hours >= 20:
-        return "throughout the day", explicit
-    return explicit, None
-
-
-def _rain_qualifier(rain_chance, tier: str) -> str:
-    value = rain_chance if rain_chance is not None else 0
-    if tier == "green":
-        if value >= 60:
-            return "high"
-        if value >= 40:
-            return "medium"
-        return "low"
-    if tier == "yellow":
-        return "significant" if value >= 65 else "moderate"
-    return "high"
-
-
-def narrative_sentence(day: dict) -> str:
-    """Natural-language forecast sentence used in both the web cell and the
-    Excel export, e.g. 'Partly cloudy skies with a high chance of light rain
-    from 7 AM to 11 PM.'"""
-    severity = day.get("severity", "none")
-    timing, peak_clause = _timing_phrase(day)
-    cloud = _cloud_phrase(day)
-    overlay = f" {day['weather_alert']}." if day.get("weather_alert") else ""
-
-    if severity in ("orange", "red"):
-        sentence = f"Expect a high chance of consistent moderate to heavy rain {timing}."
-    elif severity == "yellow":
-        if _stable_pick(day, 2) == 0:
-            qualifier = _rain_qualifier(day.get("rain_chance"), "yellow")
-            sentence = f"Widespread cloudiness is forecasted, along with a {qualifier} chance of light to moderate rain {timing}."
-        else:
-            sentence = f"{cloud} skies with a strong likelihood of light to moderate rainfall {timing}."
-        if peak_clause:
-            sentence = sentence[:-1] + f", particularly {peak_clause}."
-    elif severity == "green":
-        qualifier = _rain_qualifier(day.get("rain_chance"), "green")
-        sentence = f"{cloud} skies with a {qualifier} chance of light rain {timing}."
-    else:
-        sentence = f"{cloud} skies with a low chance of rain."
-    return f"{sentence}{overlay}"
+def forecast_sentence(day: dict) -> str:
+    """Plain-language sentence for one Excel cell, e.g. 'Partly cloudy skies
+    with a high chance of light rain from 7 AM to 11 PM.' The severity color
+    fill (green/yellow/orange/red) carries the risk level, so the text itself
+    stays natural and readable rather than repeating a GREEN/YELLOW/ORANGE tag."""
+    sentence = day.get("narrative") or f"{day['condition']}."
+    if day.get("severity") == "red":
+        sentence += " Admin-flagged: treat as elevated risk regardless of the modeled rain chance."
+    return sentence
 
 
 def export_workbook(payload: dict) -> BytesIO:
@@ -629,18 +670,18 @@ def export_workbook(payload: dict) -> BytesIO:
     ws.append([None, "Site", *dates])
     for row in payload["rows"]:
         values = [row["region"], row["site"]]
-        values += [f"{narrative_sentence(d)}\n{d.get('forecast_window','')}" for d in row["days"][:5]]
+        values += [forecast_sentence(d) for d in row["days"][:5]]
         values += ["Forecast unavailable"] * (7 - len(values))
         ws.append(values)
 
     severity_fills = {
-        "green": PatternFill("solid", fgColor="17AB56"),
-        "yellow": PatternFill("solid", fgColor="E8EB38"),
-        "orange": PatternFill("solid", fgColor="E8B92E"),
-        "red": PatternFill("solid", fgColor="E8001B"),
+        "green": PatternFill("solid", fgColor="C6EFCE"),
+        "yellow": PatternFill("solid", fgColor="FFF2CC"),
+        "orange": PatternFill("solid", fgColor="F4B183"),
+        "red": PatternFill("solid", fgColor="FF6B6B"),
         "none": PatternFill("solid", fgColor="F2F2F2"),
     }
-    severity_fonts = {"green": "0B2B16", "yellow": "3A3B08", "orange": "3D2B00", "red": "FFFFFF", "none": "595959"}
+    severity_fonts = {"green": "006100", "yellow": "7F6000", "orange": "9C0006", "red": "FFFFFF", "none": "595959"}
     for row_index, row in enumerate(payload["rows"], start=2):
         for day_index, day in enumerate(row["days"][:5], start=3):
             # Use the final displayed severity. Admin overrides set this value to red.
