@@ -675,20 +675,20 @@ def export_workbook(payload: dict) -> BytesIO:
         ws.append(values)
 
     severity_fills = {
-        "green": PatternFill("solid", fgColor="C6EFCE"),
-        "yellow": PatternFill("solid", fgColor="FFF2CC"),
-        "orange": PatternFill("solid", fgColor="F4B183"),
-        "red": PatternFill("solid", fgColor="FF6B6B"),
-        "none": PatternFill("solid", fgColor="F2F2F2"),
+        "green": PatternFill("solid", fgColor="1E8449"),
+        "yellow": PatternFill("solid", fgColor="E8C400"),
+        "orange": PatternFill("solid", fgColor="D35400"),
+        "red": PatternFill("solid", fgColor="C0392B"),
+        "none": PatternFill("solid", fgColor="BFBFBF"),
     }
-    severity_fonts = {"green": "006100", "yellow": "7F6000", "orange": "9C0006", "red": "FFFFFF", "none": "595959"}
+    severity_fonts = {"green": "FFFFFF", "yellow": "3D2E00", "orange": "FFFFFF", "red": "FFFFFF", "none": "404040"}
     for row_index, row in enumerate(payload["rows"], start=2):
         for day_index, day in enumerate(row["days"][:5], start=3):
             # Use the final displayed severity. Admin overrides set this value to red.
             final_severity = day.get("severity", "none")
             cell = ws.cell(row_index, day_index)
             cell.fill = severity_fills.get(final_severity, severity_fills["none"])
-            cell.font = Font(color=severity_fonts.get(final_severity, severity_fonts["none"]), bold=final_severity == "red")
+            cell.font = Font(color=severity_fonts.get(final_severity, severity_fonts["none"]), bold=final_severity in ("red", "orange"))
 
     navy, blue, white = "17365D", "D9EAF7", "FFFFFF"
     ws["B1"].fill = PatternFill("solid", fgColor=navy)
@@ -728,11 +728,11 @@ def export_workbook(payload: dict) -> BytesIO:
     meta.append([])
     meta.append(["Rainfall intensity", "Meaning"])
     legend = [
-        ("GREEN", "Light rain (<2.5 mm/hr modeled)", "C6EFCE", "006100"),
-        ("YELLOW", "Moderate rain (2.5\u20137.5 mm/hr modeled)", "FFF2CC", "7F6000"),
-        ("ORANGE", "Heavy rain (>7.5 mm/hr modeled) or thunderstorm risk", "F4B183", "9C0006"),
-        ("RED", "Admin override; discretionary escalation applied in production", "FF6B6B", "FFFFFF"),
-        ("GRAY", "No rain classification", "F2F2F2", "595959"),
+        ("GREEN", "Light rain (<2.5 mm/hr modeled)", "1E8449", "FFFFFF"),
+        ("YELLOW", "Moderate rain (2.5\u20137.5 mm/hr modeled)", "E8C400", "3D2E00"),
+        ("ORANGE", "Heavy rain (>7.5 mm/hr modeled) or thunderstorm risk", "D35400", "FFFFFF"),
+        ("RED", "Admin override; discretionary escalation applied in production", "C0392B", "FFFFFF"),
+        ("GRAY", "No rain classification", "BFBFBF", "404040"),
     ]
     for level, meaning, fill, font_color in legend:
         meta.append([level, meaning])
