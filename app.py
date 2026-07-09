@@ -653,12 +653,10 @@ def build_payload() -> dict:
 def forecast_sentence(day: dict) -> str:
     """Plain-language sentence for one Excel cell, e.g. 'Partly cloudy skies
     with a high chance of light rain from 7 AM to 11 PM.' The severity color
-    fill (green/yellow/orange/red) carries the risk level, so the text itself
-    stays natural and readable rather than repeating a GREEN/YELLOW/ORANGE tag."""
-    sentence = day.get("narrative") or f"{day['condition']}."
-    if day.get("red_override") or day.get("orange_override") or day.get("yellow_override"):
-        sentence += " Admin-flagged: treat as elevated risk regardless of the modeled rain chance."
-    return sentence
+    fill (green/yellow/orange/red) carries the risk level, including when an
+    admin override is active, so the text itself stays natural and readable
+    rather than repeating a GREEN/YELLOW/ORANGE/admin-flag tag."""
+    return day.get("narrative") or f"{day['condition']}."
 
 
 def export_workbook(payload: dict) -> BytesIO:
