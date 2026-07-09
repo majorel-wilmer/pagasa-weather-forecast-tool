@@ -120,7 +120,7 @@ class LoginPayload(BaseModel):
 class OverridePayload(BaseModel):
     site: str
     date: str
-    red: bool
+    level: str  # "none" to clear, or "orange" / "red"
 
 
 def weather_code_text(code) -> str:
@@ -230,9 +230,6 @@ def build_narrative(sky_phrase: str, rain_chance, severity: str, analysis: dict)
     coverage_full_day = analysis["coverage_full_day"]
     has_peak = analysis["has_peak"]
 
-    if coverage_full_day and intensity == "moderate to heavy" and not has_peak:
-        return f"Expect {chance_phrase} of consistent {intensity} rain throughout the day."
-
     if coverage_full_day:
         timing_clause = " throughout the day"
         if has_peak:
@@ -245,6 +242,13 @@ def build_narrative(sky_phrase: str, rain_chance, severity: str, analysis: dict)
             timing_clause = f" until {hour_label(main_end)}"
         else:
             timing_clause = f" from {hour_label(main_start)} to {hour_label(main_end)}"
+
+    # Orange and red (heavy/admin-escalated) skip the sky-condition lead-in and
+    # go straight to the risk level, e.g. "Expect a high chance of moderate to
+    # heavy rain from 2 PM to 5 PM." instead of "Overcast skies with...".
+    if severity in ("orange", "red"):
+        prefix = "consistent " if coverage_full_day and not has_peak else ""
+        return f"Expect {chance_phrase} of {prefix}{intensity} rain{timing_clause}."
 
     return f"{sky_phrase} skies with {chance_phrase} of {intensity} rain{timing_clause}."
 
@@ -619,11 +623,13 @@ def build_payload() -> dict:
     for (region, site), site_payload in zip(SITES, forecasts):
         days = build_site_days(site_payload)
         for day in days:
-            red = bool(overrides.get(override_key(site, day["date"])))
+            override_entry = overrides.get(override_key(site, day["date"])) or {}
+            level = override_entry.get("level")
             day.update({
-                "severity": "red" if red else day["automatic_severity"],
-                "red_override": red,
-                "severity_basis": "Admin override" if red else (day["overlay_source"] or "Open-Meteo hourly model"),
+                "severity": level if level in ("orange", "red") else day["automatic_severity"],
+                "red_override": level == "red",
+                "orange_override": level == "orange",
+                "severity_basis": "Admin override" if level in ("orange", "red") else (day["overlay_source"] or "Open-Meteo hourly model"),
             })
         rows.append({
             "region": region,
@@ -649,7 +655,7 @@ def forecast_sentence(day: dict) -> str:
     fill (green/yellow/orange/red) carries the risk level, so the text itself
     stays natural and readable rather than repeating a GREEN/YELLOW/ORANGE tag."""
     sentence = day.get("narrative") or f"{day['condition']}."
-    if day.get("severity") == "red":
+    if day.get("red_override") or day.get("orange_override"):
         sentence += " Admin-flagged: treat as elevated risk regardless of the modeled rain chance."
     return sentence
 
@@ -681,7 +687,7 @@ def export_workbook(payload: dict) -> BytesIO:
         "red": PatternFill("solid", fgColor="FF0000"),
         "none": PatternFill("solid", fgColor="BFBFBF"),
     }
-    severity_fonts = {"green": "FFFFFF", "yellow": "3D2E00", "orange": "3D2E00", "red": "FFFFFF", "none": "404040"}
+    severity_fonts = {"green": "000000", "yellow": "000000", "orange": "000000", "red": "FFFFFF", "none": "000000"}
     for row_index, row in enumerate(payload["rows"], start=2):
         for day_index, day in enumerate(row["days"][:5], start=3):
             # Use the final displayed severity. Admin overrides set this value to red.
@@ -728,11 +734,11 @@ def export_workbook(payload: dict) -> BytesIO:
     meta.append([])
     meta.append(["Rainfall intensity", "Meaning"])
     legend = [
-        ("GREEN", "Light rain (<2.5 mm/hr modeled)", "00B050", "FFFFFF"),
-        ("YELLOW", "Moderate rain (2.5\u20137.5 mm/hr modeled)", "FFFF00", "3D2E00"),
-        ("ORANGE", "Heavy rain (>7.5 mm/hr modeled) or thunderstorm risk", "FFC000", "3D2E00"),
+        ("GREEN", "Light rain (<2.5 mm/hr modeled)", "00B050", "000000"),
+        ("YELLOW", "Moderate rain (2.5\u20137.5 mm/hr modeled)", "FFFF00", "000000"),
+        ("ORANGE", "Heavy rain (>7.5 mm/hr modeled) or thunderstorm risk", "FFC000", "000000"),
         ("RED", "Admin override; discretionary escalation applied in production", "FF0000", "FFFFFF"),
-        ("GRAY", "No rain classification", "BFBFBF", "404040"),
+        ("GRAY", "No rain classification", "BFBFBF", "000000"),
     ]
     for level, meaning, fill, font_color in legend:
         meta.append([level, meaning])
@@ -817,16 +823,19 @@ def update_override(payload: OverridePayload, request: Request):
     if not is_admin(request):
         raise HTTPException(401, "Admin login required.")
     valid_sites = {site.casefold() for _, site in SITES}
+    level = payload.level.strip().lower()
     if payload.site.casefold() not in valid_sites or not payload.date.strip():
         raise HTTPException(400, "Invalid site or forecast date.")
+    if level not in ("none", "orange", "red"):
+        raise HTTPException(400, "Level must be 'none', 'orange', or 'red'.")
     data = load_overrides(force=True)
     key = override_key(payload.site, payload.date)
-    if payload.red:
-        data[key] = {"red": True, "updated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
-    else:
+    if level == "none":
         data.pop(key, None)
+    else:
+        data[key] = {"level": level, "updated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
     save_overrides(data)
-    return {"site": payload.site, "date": payload.date, "red_override": payload.red}
+    return {"site": payload.site, "date": payload.date, "level": level}
 
 
 @app.get("/api/export")
