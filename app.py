@@ -568,6 +568,45 @@ def _local_overrides() -> dict:
         return {}
 
 
+def override_record_time(record: dict, fallback=None) -> datetime:
+    try:
+        value = record.get("updated_at") if isinstance(record, dict) else None
+        if value:
+            return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        pass
+    if isinstance(fallback, datetime):
+        return fallback
+    return datetime.fromtimestamp(0).astimezone()
+
+
+def merge_override_snapshots(snapshots: list[tuple[datetime, dict]]) -> dict:
+    """Merge historical Blob snapshots without letting stale files delete cells.
+
+    Older production writes stored the whole override dictionary in each Blob.
+    If two adjacent cells were edited quickly, a stale full-file write could
+    omit the first edit.  Merging by per-cell updated_at keeps both edits, while
+    explicit tombstones still let admins clear a cell back to Auto.
+    """
+    merged: dict[str, dict] = {}
+    latest_times: dict[str, datetime] = {}
+    for uploaded_at, snapshot in sorted(snapshots, key=lambda item: item[0]):
+        if not isinstance(snapshot, dict):
+            continue
+        for key, record in snapshot.items():
+            if not isinstance(record, dict):
+                continue
+            record_time = override_record_time(record, uploaded_at)
+            if key in latest_times and record_time < latest_times[key]:
+                continue
+            latest_times[key] = record_time
+            if record.get("deleted"):
+                merged.pop(key, None)
+            else:
+                merged[key] = record
+    return merged
+
+
 def load_overrides(force: bool = False) -> dict:
     now = time.time()
     if not force and now - _override_cache["loaded_at"] < 10:
@@ -578,23 +617,28 @@ def load_overrides(force: bool = False) -> dict:
         try:
             from vercel.blob import list_objects
 
-            result = list_objects(prefix=OVERRIDE_PREFIX, limit=100)
-            latest = max(result.blobs, key=lambda item: item.uploaded_at, default=None)
-            data = requests.get(latest.url, params={"v": int(now)}, timeout=10).json() if latest else {}
+            result = list_objects(prefix=OVERRIDE_PREFIX, limit=1000)
+            snapshots = []
+            for blob in result.blobs:
+                try:
+                    snapshots.append((blob.uploaded_at, requests.get(blob.url, params={"v": int(now)}, timeout=10).json()))
+                except Exception:
+                    continue
+            data = merge_override_snapshots(snapshots)
         except Exception:
             data = dict(_override_cache["data"])
     _override_cache.update({"loaded_at": now, "data": data})
     return dict(data)
 
 
-def save_overrides(data: dict) -> None:
+def save_overrides(data: dict, delta: dict | None = None) -> None:
     if os.getenv("BLOB_READ_WRITE_TOKEN"):
         from vercel.blob import BlobClient
 
         filename = f"{OVERRIDE_PREFIX}{int(time.time() * 1000)}-{secrets.token_hex(4)}.json"
         BlobClient().put(
             filename,
-            json.dumps(data, separators=(",", ":")).encode("utf-8"),
+            json.dumps(delta or data, separators=(",", ":")).encode("utf-8"),
             access="public",
             content_type="application/json",
             cache_control_max_age=60,
@@ -851,18 +895,21 @@ def update_override(payload: OverridePayload, request: Request):
     severity = (payload.severity or payload.level or "").strip().casefold()
     if not severity and payload.red is not None:
         severity = "red" if payload.red else "auto"
+    updated_at = datetime.now().astimezone().isoformat(timespec="microseconds")
     if severity in OVERRIDE_SEVERITIES:
-        data[key] = {
+        record = {
             "level": severity,
             "severity": severity,
             "red": severity == "red",
-            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "updated_at": updated_at,
         }
+        data[key] = record
     elif severity in {"", "auto", "none"}:
+        record = {"deleted": True, "updated_at": updated_at}
         data.pop(key, None)
     else:
         raise HTTPException(400, "Invalid override severity.")
-    save_overrides(data)
+    save_overrides(data, delta={key: record})
     return {
         "site": payload.site,
         "date": payload.date,
