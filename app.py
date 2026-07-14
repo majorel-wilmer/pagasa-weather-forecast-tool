@@ -38,6 +38,7 @@ OPEN_METEO_ATTRIBUTION = "https://open-meteo.com/"
 
 LOCAL_OVERRIDES = ROOT / "data" / "overrides.json"
 OVERRIDE_PREFIX = "pagasa-weather-overrides/"
+OVERRIDE_SEVERITIES = {"green", "yellow", "orange", "red"}
 _override_cache = {"loaded_at": 0.0, "data": {}}
 
 # Each site is forecast individually from its own coordinates, so no site has to
@@ -120,7 +121,9 @@ class LoginPayload(BaseModel):
 class OverridePayload(BaseModel):
     site: str
     date: str
-    level: str  # "none" to clear, or "orange" / "red"
+    level: str | None = None
+    severity: str | None = None
+    red: bool | None = None
 
 
 def weather_code_text(code) -> str:
@@ -545,6 +548,19 @@ def override_key(site: str, date: str) -> str:
     return f"{site.strip().casefold()}|{date.strip().casefold()}"
 
 
+def override_severity(record) -> str | None:
+    """Return the stored admin severity, including legacy RED-only records."""
+    if not record:
+        return None
+    if isinstance(record, dict):
+        severity = str(record.get("severity") or record.get("level") or "").strip().casefold()
+        if severity in OVERRIDE_SEVERITIES:
+            return severity
+        if record.get("red"):
+            return "red"
+    return None
+
+
 def _local_overrides() -> dict:
     try:
         return json.loads(LOCAL_OVERRIDES.read_text(encoding="utf-8"))
@@ -623,14 +639,15 @@ def build_payload() -> dict:
     for (region, site), site_payload in zip(SITES, forecasts):
         days = build_site_days(site_payload)
         for day in days:
-            override_entry = overrides.get(override_key(site, day["date"])) or {}
-            level = override_entry.get("level")
+            admin_severity = override_severity(overrides.get(override_key(site, day["date"])))
             day.update({
-                "severity": level if level in ("yellow", "orange", "red") else day["automatic_severity"],
-                "red_override": level == "red",
-                "orange_override": level == "orange",
-                "yellow_override": level == "yellow",
-                "severity_basis": "Admin override" if level in ("yellow", "orange", "red") else (day["overlay_source"] or "Open-Meteo hourly model"),
+                "severity": admin_severity or day["automatic_severity"],
+                "severity_override": admin_severity,
+                "green_override": admin_severity == "green",
+                "yellow_override": admin_severity == "yellow",
+                "orange_override": admin_severity == "orange",
+                "red_override": admin_severity == "red",
+                "severity_basis": f"Admin {admin_severity.upper()} override" if admin_severity else (day["overlay_source"] or "Open-Meteo hourly model"),
             })
         rows.append({
             "region": region,
@@ -827,19 +844,32 @@ def update_override(payload: OverridePayload, request: Request):
     if not is_admin(request):
         raise HTTPException(401, "Admin login required.")
     valid_sites = {site.casefold() for _, site in SITES}
-    level = payload.level.strip().lower()
     if payload.site.casefold() not in valid_sites or not payload.date.strip():
         raise HTTPException(400, "Invalid site or forecast date.")
-    if level not in ("none", "yellow", "orange", "red"):
-        raise HTTPException(400, "Level must be 'none', 'yellow', 'orange', or 'red'.")
     data = load_overrides(force=True)
     key = override_key(payload.site, payload.date)
-    if level == "none":
+    severity = (payload.severity or payload.level or "").strip().casefold()
+    if not severity and payload.red is not None:
+        severity = "red" if payload.red else "auto"
+    if severity in OVERRIDE_SEVERITIES:
+        data[key] = {
+            "level": severity,
+            "severity": severity,
+            "red": severity == "red",
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+    elif severity in {"", "auto", "none"}:
         data.pop(key, None)
     else:
-        data[key] = {"level": level, "updated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+        raise HTTPException(400, "Invalid override severity.")
     save_overrides(data)
-    return {"site": payload.site, "date": payload.date, "level": level}
+    return {
+        "site": payload.site,
+        "date": payload.date,
+        "severity_override": None if severity in {"", "auto", "none"} else severity,
+        "red_override": severity == "red",
+        "level": "none" if severity in {"", "auto", "none"} else severity,
+    }
 
 
 @app.get("/api/export")
