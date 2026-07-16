@@ -43,7 +43,7 @@
         </section>
 
         <section id="forecast" class="forecast-panel">
-          <div class="section-heading"><div><p class="eyebrow">SITE MONITORING</p><h2>5-Day Forecast Matrix</h2></div></div>
+          <div class="section-heading"><div><p class="eyebrow">SITE MONITORING</p><h2>5-Day Forecast Matrix</h2></div><label class="forecast-date-control" for="forecast-start-date"><span>Start date</span><select id="forecast-start-date" aria-label="Select 5-day forecast start date"></select></label></div>
           <div class="legend" aria-label="Rainfall warning legend">
             <span class="legend-label">Rainfall intensity</span>
             <span class="legend-item green">Light / rainshowers</span>
@@ -61,7 +61,7 @@
     </div>
   </div>
   <dialog id="admin-dialog"><form id="admin-form" method="dialog"><button class="dialog-close" type="button" aria-label="Close">×</button><p class="eyebrow">RESTRICTED CONTROL</p><h2>Admin access</h2><p>Sign in to apply or remove per-cell severity overrides.</p><label for="admin-password">Password</label><input id="admin-password" type="password" autocomplete="current-password" required><p id="admin-error" class="form-error" role="alert"></p><button class="dialog-submit" type="submit">Sign in</button></form></dialog>
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=3"></script>
   <script src="/static/chatbot.js?v=1"></script>
 </body>
 </html>

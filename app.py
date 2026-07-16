@@ -311,7 +311,10 @@ def fetch_all_forecasts() -> list[dict]:
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_gusts_10m_max",
         "hourly": "precipitation_probability,precipitation,weather_code,temperature_2m",
         "timezone": "Asia/Manila",
-        "forecast_days": 5,
+        # Fetch enough days for the dashboard date selector.  The table still
+        # displays only a 5-day window, but users can start that window later
+        # in the current/next-week forecast range.
+        "forecast_days": 16,
         "wind_speed_unit": "kmh",
     }
     response = requests.get(OPEN_METEO_FORECAST, params=params, timeout=25, headers={"User-Agent": "Open-Meteo-Weather-Tool/2.0"})
