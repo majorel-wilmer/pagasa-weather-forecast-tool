@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from calendar import monthrange
 from io import BytesIO
 from pathlib import Path
@@ -35,6 +35,7 @@ PANAHON_URL = "https://www.panahon.gov.ph/"
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_ATTRIBUTION = "https://open-meteo.com/"
+PH_TZ = timezone(timedelta(hours=8), "PHT")
 
 LOCAL_OVERRIDES = ROOT / "data" / "overrides.json"
 OVERRIDE_PREFIX = "pagasa-weather-overrides/"
@@ -326,7 +327,15 @@ def fetch_all_forecasts() -> list[dict]:
     return results
 
 
-def build_site_days(payload: dict) -> list[dict]:
+def build_site_days(payload: dict, now: datetime | None = None) -> list[dict]:
+    if now is None:
+        current_local = datetime.now(PH_TZ).replace(tzinfo=None)
+    elif now.tzinfo is not None:
+        current_local = now.astimezone(PH_TZ).replace(tzinfo=None)
+    else:
+        current_local = now
+    current_hour = current_local.replace(minute=0, second=0, microsecond=0)
+    today_key = current_local.strftime("%Y-%m-%d")
     daily = payload.get("daily", {})
     hourly = payload.get("hourly", {})
     hourly_times = hourly.get("time", [])
@@ -349,14 +358,17 @@ def build_site_days(payload: dict) -> list[dict]:
     for i, date_text in enumerate(dates):
         label = datetime.strptime(date_text, "%Y-%m-%d").strftime("%A %B %d, %Y")
         hours = sorted(hours_by_date.get(date_text, []), key=lambda h: h["time"])
-        window_label, has_window, max_precip = rain_window(hours)
-        day_codes = [h["code"] for h in hours if h["code"] is not None]
+        effective_hours = [h for h in hours if h["time"] >= current_hour] if date_text == today_key else hours
+        window_label, has_window, max_precip = rain_window(effective_hours)
+        day_codes = [h["code"] for h in effective_hours if h["code"] is not None]
         code = daily.get("weather_code", [None] * len(dates))[i]
-        rain_chance = daily.get("precipitation_probability_max", [None] * len(dates))[i]
+        daily_rain_chance = daily.get("precipitation_probability_max", [None] * len(dates))[i]
+        remaining_probs = [h["prob"] for h in effective_hours if h["prob"] is not None]
+        rain_chance = max(remaining_probs) if date_text == today_key and remaining_probs else daily_rain_chance
         severity = classify_severity(max_precip, rain_chance, day_codes)
         gust = daily.get("wind_gusts_10m_max", [None] * len(dates))[i]
         sky_phrase = SKY_PHRASES.get(code, "Partly cloudy") if code is not None else "Partly cloudy"
-        narrative = build_narrative(sky_phrase, rain_chance, severity, analyze_rain_day(hours))
+        narrative = build_narrative(sky_phrase, rain_chance, severity, analyze_rain_day(effective_hours))
 
         alert = ""
         alert_level = "none"
