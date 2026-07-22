@@ -726,6 +726,29 @@ def build_payload() -> dict:
     }
 
 
+def payload_for_export_window(payload: dict, start_date: str | None = None) -> dict:
+    first_days = next((row["days"] for row in payload["rows"] if row.get("days")), [])
+    start_index = 0
+    if start_date and first_days:
+        requested = start_date.strip().casefold()
+        for index, day in enumerate(first_days):
+            if str(day.get("date", "")).strip().casefold() == requested:
+                start_index = index
+                break
+    if first_days:
+        start_index = min(start_index, max(0, len(first_days) - 5))
+
+    export_payload = dict(payload)
+    export_rows = []
+    for row in payload["rows"]:
+        export_row = dict(row)
+        export_row["days"] = row.get("days", [])[start_index:start_index + 5]
+        export_rows.append(export_row)
+    export_payload["rows"] = export_rows
+    export_payload["export_start_date"] = first_days[start_index]["date"] if first_days else ""
+    return export_payload
+
+
 def forecast_sentence(day: dict) -> str:
     """Plain-language sentence for one Excel cell, e.g. 'Partly cloudy skies
     with a high chance of light rain from 7 AM to 11 PM.' The severity color
@@ -935,8 +958,8 @@ def update_override(payload: OverridePayload, request: Request):
 
 
 @app.get("/api/export")
-def export():
-    payload = build_payload()
+def export(start: str | None = None):
+    payload = payload_for_export_window(build_payload(), start)
     stream = export_workbook(payload)
     filename = f"5-Day_Forecast_{datetime.now():%Y%m%d}.xlsx"
     return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})

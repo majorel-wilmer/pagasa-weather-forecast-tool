@@ -13,6 +13,7 @@ const outlookContent = document.querySelector('#outlook-content');
 const outlookSource = document.querySelector('#outlook-source');
 const riskCount = document.querySelector('#risk-count');
 const dateSelect = document.querySelector('#forecast-start-date');
+const exportLink = document.querySelector('#export-link');
 const REFRESH_MS = 30 * 60 * 1000;
 const WINDOW_DAYS = 5;
 
@@ -88,11 +89,16 @@ function syncDateSelector(data) {
   if (!starts.length) {
     dateSelect.innerHTML = '<option>No dates available</option>';
     dateSelect.disabled = true;
+    if (exportLink) exportLink.href = '/api/export';
     return;
   }
   if (!selectedStartDate || !starts.includes(selectedStartDate)) selectedStartDate = starts[0];
   dateSelect.disabled = false;
   dateSelect.innerHTML = starts.map((date) => `<option value="${esc(date)}"${date === selectedStartDate ? ' selected' : ''}>${esc(shortDate(date))}</option>`).join('');
+  if (exportLink) {
+    const params = new URLSearchParams({ start: selectedStartDate });
+    exportLink.href = `/api/export?${params.toString()}`;
+  }
 }
 
 function render(data) {
